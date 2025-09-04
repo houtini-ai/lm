@@ -1,6 +1,6 @@
-# Houtini LM - Local AI Development Assistant
+# Houtini LM - LM Studio MCP Server with Expert Prompt Library and Custom Prompting
 
-**Version**: 1.0.0  
+**Version**: 1.0.1  
 **Your unlimited AI companion: This MCP server connects Claude to LM Studio for code analysis, generation, and creativity**
 
 Transform your development workflow with our expert-level prompt library for code analysis, professional documentation generation, and creative project scaffolding - all running locally without API costs. For developers, vibe coders and creators alike.
