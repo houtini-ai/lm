@@ -1,6 +1,6 @@
 {
   "name": "@houtini/lm",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Local LM MCP server - unlimited AI-assisted development without API costs",
   "main": "dist/index.js",
   "type": "module",
