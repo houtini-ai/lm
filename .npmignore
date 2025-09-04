@@ -4,6 +4,11 @@ tests/
 diagnostics/
 scripts/
 
+# CRITICAL: Protect proprietary template system
+src/templates/
+templates/
+src/templates/plugin-template.ts
+
 # Development files
 .env*
 *.log
@@ -19,15 +24,18 @@ add-shebang.js
 .github/
 .gitignore
 
-# Node modules
+# Node modules and locks
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+package-lock.json
 
 # Coverage and test outputs
 coverage/
 .nyc_output/
+*.test.*
+*.spec.*
 
 # Documentation source (keep README.md and CHANGELOG.md)
 docs/
@@ -35,21 +43,28 @@ examples/
 *.md
 !README.md
 !CHANGELOG.md
+!LICENSE
 
-# Build artifacts
+# Build artifacts and temporary files
 *.tgz
 *.tar.gz
+build/
+lib/
+temp/
+tmp/
 
-# OS files
+# OS and IDE files
 .DS_Store
 Thumbs.db
-
-# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# Temporary files
-temp/
-tmp/
+# TypeScript build configs
+tsconfig.*.json
+
+# Development utilities
+diagnostic/
+*.map
