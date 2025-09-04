@@ -1,13 +1,13 @@
 # Houtini LM - Local AI Development Assistant
 
 **Version**: 1.0.0  
-**Your unlimited AI companion for code analysis, generation, and creativity**
+**Your unlimited AI companion: This MCP server connects Claude to LM Studio for code analysis, generation, and creativity**
 
-Transform your development workflow with expert-level code analysis, professional documentation generation, and creative project scaffolding - all running locally without API costs.
+Transform your development workflow with our expert-level prompt library for code analysis, professional documentation generation, and creative project scaffolding - all running locally without API costs. For developers, vibe coders and creators alike.
 
 ## What This Does
 
-Houtini LM **saves your Claude context window** by handling detailed analysis tasks locally whilst Claude focuses on strategy and complex problem-solving. Think of it as your intelligent coding assistant that never runs out of tokens.
+Houtini LM **saves your Claude context window** by offloading detailed analysis tasks to LM Studio locally or on your company network whilst Claude focuses on strategy and complex problem-solving. Think of it as your intelligent coding assistant that never runs out of tokens.
 
 **Perfect for:**
 - 🔍 **Code analysis** - Deep insights into quality, security, and architecture
