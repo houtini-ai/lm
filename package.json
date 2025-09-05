@@ -1,6 +1,6 @@
 {
   "name": "@houtini/lm",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "type": "module",
   "description": "Houtini LM - LM Studio MCP Server with Expert Prompt Library and Custom Prompting",
   "main": "dist/index.js",
