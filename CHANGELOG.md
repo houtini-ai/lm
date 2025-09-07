@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.10] - 2025-01-09
+
+### Fixed
+- **Increased timeout to 5 minutes** - Changed LM Studio timeout from 120000ms (2 minutes) to 300000ms (5 minutes)
+  - Prevents timeouts on large multi-file analysis and complex generation tasks
+  - Improves reliability for slower local models or heavily loaded systems
+  - Addresses timeout issues with project-wide security audits and creative functions
+  - Particularly beneficial for WordPress plugin/theme analysis and large codebase operations
+
 ## [4.1.0] - 2025-08-29
 
 ### 🎉 MAJOR RELEASE - 3-Stage Architecture Complete
