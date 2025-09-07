@@ -11,7 +11,7 @@ export const config: Config = {
   temperature: 0.1,
   // maxTokens removed - now calculated dynamically by TokenCalculator
   topP: 0.95,
-  timeout: 120000, // Increased from 30s to 2 minutes for complex analysis
+  timeout: 300000, // Increased to 5 minutes for complex analysis and large projects
   maxFileSize: 200 * 1024 * 1024,  // 200MB limit
   supportedFileTypes: [
     '.csv', '.json', '.txt', '.js', '.ts', '.py', '.md', '.log', 
