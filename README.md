@@ -89,8 +89,8 @@ Add to your Claude Desktop configuration file:
 {
   "mcpServers": {
     "houtini-lm": {
-      "command": "node",
-      "args": ["path/to/houtini-lm/index.js"],
+      "command": "npx",
+      "args": ["@houtini/lm"],
       "env": {
         "LLM_MCP_ALLOWED_DIRS": "C:/your-projects,C:/dev,C:/websites"
       }
