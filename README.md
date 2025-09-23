@@ -67,15 +67,14 @@ Generate responsive HTML components using houtini-lm for a pricing card with dar
 
 ## Installation
 
-### 1. Install Dependencies
+### 1. Install the Package
 
 ```bash
-# Clone the repository
-git clone https://github.com/houtini-ai/lm.git
-cd lm
+# Install globally via npm
+npm install -g @houtini/lm
 
-# Install Node.js dependencies
-npm install
+# Or use npx (no installation required)
+npx @houtini/lm
 ```
 
 ### 2. Configure Claude Desktop
