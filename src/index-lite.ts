@@ -221,19 +221,19 @@ class HoutiniLMLite {
       }
       
       // Get available models
-      const models = await this.lmStudioClient.llm.listDownloadedModels();
+      const models = await this.lmStudioClient.llm.listLoaded();
       if (models.length === 0) {
         throw new Error('No models loaded in LM Studio. Please load a model first.');
       }
       
-      const model = await this.lmStudioClient.llm.get({ identifier: models[0] });
+      // Use the first loaded model
+      const model = models[0];
       
       // Execute the prompt
       const startTime = Date.now();
       const response = await model.complete(fullPrompt, {
         temperature,
-        maxTokens,
-        timeout: config.timeout
+        maxTokens
       });
       
       const executionTime = Date.now() - startTime;
@@ -244,7 +244,7 @@ class HoutiniLMLite {
           text: response
         }],
         metadata: {
-          model: models[0],
+          model: models[0].identifier,
           executionTimeMs: executionTime,
           temperature,
           maxTokens
@@ -348,7 +348,7 @@ class HoutiniLMLite {
    */
   private async checkHealth() {
     try {
-      const models = await this.lmStudioClient.llm.listDownloadedModels();
+      const models = await this.lmStudioClient.llm.listLoaded();
       
       return {
         content: [{
@@ -356,7 +356,7 @@ class HoutiniLMLite {
           text: `LM Studio is running and connected.
 URL: ${config.lmStudioUrl}
 Available models: ${models.length}
-${models.length > 0 ? `Active model: ${models[0]}` : 'No models loaded - please load a model in LM Studio'}`
+${models.length > 0 ? `Active model: ${models[0].identifier}` : 'No models loaded - please load a model in LM Studio'}`
         }]
       };
     } catch (error: any) {
