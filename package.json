@@ -46,7 +46,7 @@
   },
   "dependencies": {
     "@lmstudio/sdk": "^1.5.0",
-    "@modelcontextprotocol/sdk": "^1.17.3",
+    "@modelcontextprotocol/sdk": "^1.18.0",
     "puppeteer": "^21.11.0",
     "css-tree": "^2.3.1"
   },
