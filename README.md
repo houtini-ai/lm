@@ -4,6 +4,10 @@
 
 Transform your development workflow with our expert-level prompt library for code analysis, professional documentation generation, and creative project scaffolding - all running locally without API costs. For developers, vibe coders and creators alike.
 
+<a href="https://glama.ai/mcp/servers/@houtini-ai/lm">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@houtini-ai/lm/badge" alt="Houtini-lm MCP server" />
+</a>
+
 ## What This Does
 
 Houtini LM **saves your Claude context window** by offloading detailed analysis tasks to LM Studio locally or on your company network whilst Claude focuses on strategy and complex problem-solving. Think of it as your intelligent coding assistant that never runs out of tokens.
