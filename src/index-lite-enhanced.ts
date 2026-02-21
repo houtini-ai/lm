@@ -26,7 +26,7 @@ const config = {
   defaultTemperature: 0.7,
   defaultMaxTokens: 4096,
   timeout: 120000, // 2 minutes
-  // Dynamic token allocation settings (from original Houtini LM)
+  // Dynamic token allocation settings
   contextUsageRatio: 0.8, // Use 80% of context window (safety margin)
   minOutputTokens: 1000,   // Minimum tokens reserved for output
   tokenEstimateRatio: 3     // Conservative: 3 chars ≈ 1 token
@@ -46,7 +46,7 @@ class DynamicTokenCalculator {
   updateModelInfo(identifier: string, contextLength?: number) {
     this.modelIdentifier = identifier;
     
-    // Known model context sizes (expandable)
+    // Known model context sizes (can be expanded)
     const knownContextSizes: Record<string, number> = {
       'qwen3': 128000,
       'qwen.qwen3': 128000,
@@ -111,10 +111,12 @@ class DynamicTokenCalculator {
     const availableForOutput = usableContext - totalInputTokens;
     const optimalTokens = Math.max(minTokens, availableForOutput);
     
-    // Log calculation for transparency (to stderr for MCP)
+    // Log calculation for transparency
     console.error(`[Token Allocation] Model: ${this.modelIdentifier}`);
-    console.error(`[Token Allocation] Context: ${this.modelContextLength} → Usable: ${usableContext}`);
-    console.error(`[Token Allocation] Input: ${totalInputTokens} → Output: ${optimalTokens}`);
+    console.error(`[Token Allocation] Context Window: ${this.modelContextLength}`);
+    console.error(`[Token Allocation] Usable Context (80%): ${usableContext}`);
+    console.error(`[Token Allocation] Input Tokens: ${totalInputTokens}`);
+    console.error(`[Token Allocation] Allocated Output Tokens: ${optimalTokens}`);
     
     return optimalTokens;
   }
@@ -137,6 +139,15 @@ class DynamicTokenCalculator {
     // Need chunking if input + minimum output exceeds usable context
     return (totalInputTokens + config.minOutputTokens) > usableContext;
   }
+  
+  /**
+   * Calculate chunk size for large content
+   */
+  calculateChunkSize(): number {
+    const usableContext = Math.floor(this.modelContextLength * config.contextUsageRatio);
+    // Reserve space for system prompt and output
+    return Math.floor(usableContext * 0.5); // Use 50% for data chunks
+  }
 }
 
 class HoutiniLMLite {
@@ -149,7 +160,7 @@ class HoutiniLMLite {
       {
         name: 'houtini-lm-lite',
         version: '2.1.0',
-        description: 'Streamlined LM Studio offloading with dynamic token allocation - inspired by original Houtini LM',
+        description: 'Streamlined LM Studio offloading with dynamic token allocation',
       },
       {
         capabilities: {
@@ -211,6 +222,10 @@ class HoutiniLMLite {
               systemPrompt: {
                 type: 'string',
                 description: 'Optional system prompt to guide the model'
+              },
+              useDynamicTokens: {
+                type: 'boolean',
+                description: 'Enable dynamic token allocation (default true)'
               }
             },
             required: ['prompt']
@@ -240,6 +255,10 @@ class HoutiniLMLite {
                 type: 'number',
                 description: 'Maximum tokens (optional - uses dynamic allocation if not set)',
                 minimum: 1
+              },
+              useDynamicTokens: {
+                type: 'boolean',
+                description: 'Enable dynamic token allocation (default true)'
               }
             },
             required: ['filePath']
@@ -268,6 +287,10 @@ class HoutiniLMLite {
               combineResults: {
                 type: 'boolean',
                 description: 'Whether to combine all results into one response (default false)'
+              },
+              useDynamicTokens: {
+                type: 'boolean',
+                description: 'Enable dynamic token allocation for each prompt (default true)'
               }
             },
             required: ['prompts']
@@ -278,7 +301,29 @@ class HoutiniLMLite {
           description: 'Check LM Studio connection and model capabilities',
           inputSchema: {
             type: 'object',
-            properties: {}
+            properties: {
+              detailed: {
+                type: 'boolean',
+                description: 'Include detailed model information (default false)'
+              }
+            }
+          }
+        },
+        {
+          name: 'get_token_info',
+          description: 'Get information about current token allocation settings',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              prompt: {
+                type: 'string',
+                description: 'Optional prompt to calculate tokens for'
+              },
+              context: {
+                type: 'string',
+                description: 'Optional context to include in calculation'
+              }
+            }
           }
         }
       ]
@@ -300,7 +345,10 @@ class HoutiniLMLite {
             return await this.executeBatchPrompts(args);
             
           case 'health_check':
-            return await this.checkHealth();
+            return await this.checkHealth(args);
+            
+          case 'get_token_info':
+            return await this.getTokenInfo(args);
             
           default:
             throw new Error(`Unknown tool: ${name}`);
@@ -340,7 +388,8 @@ class HoutiniLMLite {
       context = '',
       temperature = config.defaultTemperature,
       maxTokens,
-      systemPrompt = ''
+      systemPrompt = '',
+      useDynamicTokens = true
     } = args;
     
     try {
@@ -353,17 +402,19 @@ class HoutiniLMLite {
         fullPrompt = `Context: ${context}\n\n${prompt}`;
       }
       
-      // Calculate optimal tokens using dynamic allocation
-      const finalMaxTokens = this.tokenCalculator.calculateOptimalTokens(
-        prompt,
-        context,
-        systemPrompt,
-        { forceTokens: maxTokens }
-      );
+      // Calculate optimal tokens if dynamic allocation is enabled
+      const finalMaxTokens = useDynamicTokens 
+        ? this.tokenCalculator.calculateOptimalTokens(
+            prompt,
+            context,
+            systemPrompt,
+            { forceTokens: maxTokens }
+          )
+        : (maxTokens || config.defaultMaxTokens);
       
       // Check if content needs chunking
-      if (this.tokenCalculator.needsChunking(prompt, context, systemPrompt)) {
-        console.error('[Warning] Content may exceed context - consider breaking into smaller chunks');
+      if (useDynamicTokens && this.tokenCalculator.needsChunking(prompt, context, systemPrompt)) {
+        console.error('[Token Allocation] Content exceeds context - consider chunking');
       }
       
       // Get available models
@@ -394,7 +445,9 @@ class HoutiniLMLite {
           executionTimeMs: executionTime,
           temperature,
           maxTokens: finalMaxTokens,
-          inputTokensEstimate: this.tokenCalculator.estimateTokens(fullPrompt)
+          dynamicTokensUsed: useDynamicTokens,
+          inputTokensEstimate: this.tokenCalculator.estimateTokens(fullPrompt),
+          outputTokensAllocated: finalMaxTokens
         }
       };
     } catch (error: any) {
@@ -410,7 +463,8 @@ class HoutiniLMLite {
       filePath,
       variables = {},
       temperature = config.defaultTemperature,
-      maxTokens
+      maxTokens,
+      useDynamicTokens = true
     } = args;
     
     try {
@@ -424,11 +478,12 @@ class HoutiniLMLite {
         processedPrompt = processedPrompt.replace(pattern, String(value));
       }
       
-      // Execute the processed prompt with dynamic tokens
+      // Execute the processed prompt
       return await this.executeCustomPrompt({
         prompt: processedPrompt,
         temperature,
-        maxTokens
+        maxTokens,
+        useDynamicTokens
       });
     } catch (error: any) {
       if (error.code === 'ENOENT') {
@@ -442,7 +497,7 @@ class HoutiniLMLite {
    * Execute multiple prompts in sequence with dynamic token allocation
    */
   private async executeBatchPrompts(args: any) {
-    const { prompts, combineResults = false } = args;
+    const { prompts, combineResults = false, useDynamicTokens = true } = args;
     const results = [];
     
     // Initialize model info once for all prompts
@@ -450,7 +505,10 @@ class HoutiniLMLite {
     
     for (const [index, promptConfig] of prompts.entries()) {
       try {
-        const result = await this.executeCustomPrompt(promptConfig);
+        const result = await this.executeCustomPrompt({
+          ...promptConfig,
+          useDynamicTokens
+        });
         results.push({
           index,
           success: true,
@@ -480,7 +538,8 @@ class HoutiniLMLite {
         metadata: {
           totalPrompts: prompts.length,
           successful: results.filter(r => r.success).length,
-          failed: results.filter(r => !r.success).length
+          failed: results.filter(r => !r.success).length,
+          dynamicTokensUsed: useDynamicTokens
         }
       };
     }
@@ -494,9 +553,11 @@ class HoutiniLMLite {
   }
   
   /**
-   * Enhanced health check showing model capabilities
+   * Enhanced health check with model capabilities
    */
-  private async checkHealth() {
+  private async checkHealth(args: any = {}) {
+    const { detailed = false } = args;
+    
     try {
       const models = await this.lmStudioClient.llm.listLoaded();
       
@@ -511,14 +572,16 @@ Available models: ${models.length}`;
 
       if (models.length > 0) {
         const modelId = models[0].identifier;
-        const contextWindow = (this.tokenCalculator as any).modelContextLength;
-        const usableContext = Math.floor(contextWindow * config.contextUsageRatio);
+        healthInfo += `\nActive model: ${modelId}`;
         
-        healthInfo += `
-Active model: ${modelId}
-Context window: ${contextWindow.toLocaleString()} tokens
-Usable context (80%): ${usableContext.toLocaleString()} tokens
-Dynamic token allocation: Enabled`;
+        if (detailed) {
+          // Try to get model context info
+          const contextEstimate = this.tokenCalculator['modelContextLength'];
+          healthInfo += `\nEstimated context window: ${contextEstimate.toLocaleString()} tokens`;
+          healthInfo += `\nUsable context (80%): ${Math.floor(contextEstimate * 0.8).toLocaleString()} tokens`;
+          healthInfo += `\nToken estimation ratio: 3 chars ≈ 1 token`;
+          healthInfo += `\nDynamic token allocation: Enabled`;
+        }
       } else {
         healthInfo += '\nNo models loaded - please load a model in LM Studio';
       }
@@ -540,10 +603,50 @@ Please ensure LM Studio is running and the server is enabled at ${config.lmStudi
     }
   }
   
+  /**
+   * Get token allocation information
+   */
+  private async getTokenInfo(args: any) {
+    const { prompt = '', context = '' } = args;
+    
+    try {
+      await this.initializeModelInfo();
+      
+      const inputTokens = this.tokenCalculator.estimateTokens(prompt + context);
+      const optimalOutput = this.tokenCalculator.calculateOptimalTokens(prompt, context);
+      const needsChunking = this.tokenCalculator.needsChunking(prompt, context);
+      const chunkSize = this.tokenCalculator.calculateChunkSize();
+      
+      const info = {
+        modelContextWindow: this.tokenCalculator['modelContextLength'],
+        usableContext: Math.floor(this.tokenCalculator['modelContextLength'] * config.contextUsageRatio),
+        inputTokensEstimate: inputTokens,
+        optimalOutputTokens: optimalOutput,
+        totalTokensWillUse: inputTokens + optimalOutput,
+        needsChunking,
+        recommendedChunkSize: needsChunking ? chunkSize : null,
+        settings: {
+          contextUsageRatio: config.contextUsageRatio,
+          minOutputTokens: config.minOutputTokens,
+          tokenEstimateRatio: config.tokenEstimateRatio
+        }
+      };
+      
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify(info, null, 2)
+        }]
+      };
+    } catch (error: any) {
+      throw new Error(`Token info error: ${error.message}`);
+    }
+  }
+  
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Houtini LM Lite server started (v2.1.0 with dynamic token allocation)');
+    console.error('Houtini LM Lite Enhanced server started (v2.1.0 with dynamic tokens)');
   }
 }
 

@@ -111,10 +111,7 @@ class DynamicTokenCalculator {
     const availableForOutput = usableContext - totalInputTokens;
     const optimalTokens = Math.max(minTokens, availableForOutput);
     
-    // Log calculation for transparency (to stderr for MCP)
-    console.error(`[Token Allocation] Model: ${this.modelIdentifier}`);
-    console.error(`[Token Allocation] Context: ${this.modelContextLength} → Usable: ${usableContext}`);
-    console.error(`[Token Allocation] Input: ${totalInputTokens} → Output: ${optimalTokens}`);
+    // Removed console.error statements that interfere with JSON-RPC
     
     return optimalTokens;
   }
@@ -136,6 +133,18 @@ class DynamicTokenCalculator {
     
     // Need chunking if input + minimum output exceeds usable context
     return (totalInputTokens + config.minOutputTokens) > usableContext;
+  }
+  
+  /**
+   * Get diagnostic info for debugging (without console output)
+   */
+  getDiagnostics(): any {
+    return {
+      model: this.modelIdentifier,
+      contextWindow: this.modelContextLength,
+      usableContext: Math.floor(this.modelContextLength * config.contextUsageRatio),
+      contextUsageRatio: config.contextUsageRatio
+    };
   }
 }
 
@@ -168,9 +177,9 @@ class HoutiniLMLite {
     
     this.setupHandlers();
     
-    // Error handling
+    // Error handling - removed console.error
     this.server.onerror = (error) => {
-      console.error('[Server Error]:', error);
+      // Silent error handling for MCP compliance
     };
     
     process.on('SIGINT', async () => {
@@ -361,10 +370,9 @@ class HoutiniLMLite {
         { forceTokens: maxTokens }
       );
       
-      // Check if content needs chunking
-      if (this.tokenCalculator.needsChunking(prompt, context, systemPrompt)) {
-        console.error('[Warning] Content may exceed context - consider breaking into smaller chunks');
-      }
+      // Get diagnostic info for the response
+      const diagnostics = this.tokenCalculator.getDiagnostics();
+      const needsChunking = this.tokenCalculator.needsChunking(prompt, context, systemPrompt);
       
       // Get available models
       const models = await this.lmStudioClient.llm.listLoaded();
@@ -384,18 +392,30 @@ class HoutiniLMLite {
       
       const executionTime = Date.now() - startTime;
       
+      // Extract the actual text content from the response
+      const responseText = typeof response === 'string' ? response : 
+                          (response as any).content || (response as any).text || 
+                          JSON.stringify(response);
+      
+      // Format response with diagnostic info embedded in the text
+      const responseWithInfo = `${responseText}
+
+[Token Allocation Info]
+Model: ${diagnostics.model}
+Context Window: ${diagnostics.contextWindow.toLocaleString()} tokens
+Usable Context: ${diagnostics.usableContext.toLocaleString()} tokens
+Allocated Output Tokens: ${finalMaxTokens.toLocaleString()}
+Input Estimate: ${this.tokenCalculator.estimateTokens(fullPrompt)} tokens
+Execution Time: ${executionTime}ms
+Temperature: ${temperature}
+Needs Chunking: ${needsChunking ? 'Yes - consider breaking into smaller prompts' : 'No'}`;
+      
+      // Return only the required MCP format
       return {
         content: [{
           type: 'text',
-          text: response
-        }],
-        metadata: {
-          model: models[0].identifier,
-          executionTimeMs: executionTime,
-          temperature,
-          maxTokens: finalMaxTokens,
-          inputTokensEstimate: this.tokenCalculator.estimateTokens(fullPrompt)
-        }
+          text: responseWithInfo
+        }]
       };
     } catch (error: any) {
       throw new Error(`LM Studio error: ${error.message}`);
@@ -451,11 +471,12 @@ class HoutiniLMLite {
     for (const [index, promptConfig] of prompts.entries()) {
       try {
         const result = await this.executeCustomPrompt(promptConfig);
+        // Extract just the response text, not the diagnostic info for batch
+        const responseText = result.content[0].text.split('\n\n[Token Allocation Info]')[0];
         results.push({
           index,
           success: true,
-          result: result.content[0].text,
-          metadata: result.metadata
+          result: responseText
         });
       } catch (error: any) {
         results.push({
@@ -472,16 +493,21 @@ class HoutiniLMLite {
         .map(r => `[Prompt ${r.index + 1}]:\n${r.result}`)
         .join('\n\n---\n\n');
       
+      const diagnostics = this.tokenCalculator.getDiagnostics();
+      const summaryText = `${combinedText}
+
+[Batch Execution Summary]
+Total Prompts: ${prompts.length}
+Successful: ${results.filter(r => r.success).length}
+Failed: ${results.filter(r => !r.success).length}
+Model: ${diagnostics.model}
+Context Window: ${diagnostics.contextWindow.toLocaleString()} tokens`;
+      
       return {
         content: [{
           type: 'text',
-          text: combinedText
-        }],
-        metadata: {
-          totalPrompts: prompts.length,
-          successful: results.filter(r => r.success).length,
-          failed: results.filter(r => !r.success).length
-        }
+          text: summaryText
+        }]
       };
     }
     
@@ -511,13 +537,12 @@ Available models: ${models.length}`;
 
       if (models.length > 0) {
         const modelId = models[0].identifier;
-        const contextWindow = (this.tokenCalculator as any).modelContextLength;
-        const usableContext = Math.floor(contextWindow * config.contextUsageRatio);
+        const diagnostics = this.tokenCalculator.getDiagnostics();
         
         healthInfo += `
 Active model: ${modelId}
-Context window: ${contextWindow.toLocaleString()} tokens
-Usable context (80%): ${usableContext.toLocaleString()} tokens
+Context window: ${diagnostics.contextWindow.toLocaleString()} tokens
+Usable context (80%): ${diagnostics.usableContext.toLocaleString()} tokens
 Dynamic token allocation: Enabled`;
       } else {
         healthInfo += '\nNo models loaded - please load a model in LM Studio';
@@ -543,13 +568,13 @@ Please ensure LM Studio is running and the server is enabled at ${config.lmStudi
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Houtini LM Lite server started (v2.1.0 with dynamic token allocation)');
+    // Removed console.error for MCP compliance
   }
 }
 
 // Start the server
 const server = new HoutiniLMLite();
 server.start().catch((error) => {
-  console.error('Failed to start server:', error);
+  // Silent fail for MCP compliance
   process.exit(1);
 });
