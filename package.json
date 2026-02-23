@@ -1,24 +1,33 @@
 {
   "name": "@houtini/lm",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "description": "MCP server for local LLMs — connects to LM Studio or any OpenAI-compatible endpoint",
+  "mcpName": "io.github.houtini-ai/lm",
   "main": "dist/index.js",
   "bin": {
     "houtini-lm": "dist/index.js"
   },
   "scripts": {
     "build": "tsc && node add-shebang.mjs",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "mcp-server",
     "lm-studio",
+    "ollama",
+    "vllm",
     "openai",
+    "openai-compatible",
     "local-llm",
     "claude",
-    "ai-tools"
+    "ai-tools",
+    "llama-cpp",
+    "ai",
+    "llm"
   ],
   "author": "Richard Baxter <richard@richardbaxter.co> (https://richardbaxter.co)",
   "license": "MIT",
@@ -29,6 +38,10 @@
   },
   "bugs": {
     "url": "https://github.com/houtini-ai/lm/issues"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/houtini-ai"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0"
@@ -42,6 +55,7 @@
   },
   "files": [
     "dist/**/*",
+    "server.json",
     "README.md",
     "LICENSE"
   ],

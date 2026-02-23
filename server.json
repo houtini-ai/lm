@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "Houtini LM",
+  "description": "MCP server that connects Claude to any OpenAI-compatible LLM endpoint. Offload routine analysis to a local model and preserve your Claude context window.",
+  "icon": "https://houtini.ai/favicon.ico",
+  "repository": {
+    "url": "https://github.com/houtini-ai/lm",
+    "source": "github"
+  },
+  "version": "2.0.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@houtini/lm",
+      "version": "2.0.1",
+      "transport": [
+        {
+          "type": "stdio"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "LM_STUDIO_URL",
+          "description": "Base URL of the OpenAI-compatible API endpoint",
+          "isRequired": false,
+          "format": "url"
+        },
+        {
+          "name": "LM_STUDIO_MODEL",
+          "description": "Model identifier to use for requests (auto-detected if not set)",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "LM_STUDIO_PASSWORD",
+          "description": "Bearer token for API authentication (no auth if blank)",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

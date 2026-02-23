@@ -13,10 +13,17 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://hopper:1234';
+const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
+const LM_PASSWORD = process.env.LM_STUDIO_PASSWORD || '';
 const DEFAULT_MAX_TOKENS = 4096;
 const DEFAULT_TEMPERATURE = 0.3;
+
+function apiHeaders(): Record<string, string> {
+  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (LM_PASSWORD) h['Authorization'] = `Bearer ${LM_PASSWORD}`;
+  return h;
+}
 
 // ── OpenAI-compatible API helpers ────────────────────────────────────
 
@@ -51,7 +58,7 @@ async function chatCompletion(
 
   const res = await fetch(`${LM_BASE_URL}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: apiHeaders(),
     body: JSON.stringify(body),
   });
 
@@ -64,7 +71,7 @@ async function chatCompletion(
 }
 
 async function listModels(): Promise<string[]> {
-  const res = await fetch(`${LM_BASE_URL}/v1/models`);
+  const res = await fetch(`${LM_BASE_URL}/v1/models`, { headers: apiHeaders() });
   if (!res.ok) throw new Error(`Failed to list models: ${res.status}`);
   const data = (await res.json()) as { data: Array<{ id: string }> };
   return data.data.map((m) => m.id);
@@ -119,7 +126,7 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.0.0' },
+  { name: 'houtini-lm', version: '2.0.1' },
   { capabilities: { tools: {} } },
 );
 
@@ -202,7 +209,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: `Connected to ${LM_BASE_URL} (${ms}ms)\nModels loaded: ${models.length}${models.length ? '\n' + models.join(', ') : ''}`,
+              text: `Connected to ${LM_BASE_URL} (${ms}ms)\nAuth: ${LM_PASSWORD ? 'enabled' : 'none'}\nModels loaded: ${models.length}${models.length ? '\n' + models.join(', ') : ''}`,
             },
           ],
         };
