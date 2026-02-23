@@ -1,6 +1,9 @@
+#!/usr/bin/env node
 /**
- * Houtini LM MCP Server - Plugin Architecture v1.0
- * Complete plugin-based replacement of legacy switch-case system
+ * Houtini LM — MCP Server for Local LLMs via OpenAI-compatible API
+ *
+ * Connects to LM Studio (or any OpenAI-compatible endpoint) and exposes
+ * chat, custom prompts, and model info as MCP tools.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -8,281 +11,221 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ListPromptsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { LMStudioClient } from '@lmstudio/sdk';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
-import { pathToFileURL } from 'url';
-import fs from 'fs';
-import { config } from './config.js';
-import { PluginLoader, PluginRegistry } from './plugins/index.js';
 
-// ES module __dirname equivalent
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://hopper:1234';
+const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
+const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_TEMPERATURE = 0.3;
 
-class HoutiniLMServer {
-  private server: Server;
-  private lmStudioClient: LMStudioClient;
-  private pluginLoader: PluginLoader;
-  private pluginsInitialized: boolean = false;
+// ── OpenAI-compatible API helpers ────────────────────────────────────
 
-  constructor() {
-    this.server = new Server(
-      {
-        name: 'houtini-lm',
-        version: '1.0.7',
-        description: 'Local AI development companion - unlimited analysis and generation without API costs. Preserves Claude context by offloading routine tasks to local LM Studio.',
-      },
-      {
-        capabilities: {
-          tools: {
-            description: 'Context preservation through local processing - use for routine tasks, save Claude for strategy'
-          },
-          resources: {
-            description: 'Local LM Studio integration with unlimited processing'
-          },
-          prompts: {
-            description: 'Three-stage prompting system with expert personas'
-          }
-        },
-      }
-    );
-
-    // Note: Security validation will be done during server start
-    
-    this.lmStudioClient = new LMStudioClient({
-      baseUrl: config.lmStudioUrl,
-    });
-    
-    this.pluginLoader = PluginRegistry.getInstance();
-
-    this.setupHandlers();
-    
-    // Error handling
-    this.server.onerror = (error) => {
-      // Silent error handling for MCP protocol compliance
-    };
-    process.on('SIGINT', async () => {
-      await this.server.close();
-      process.exit(0);
-    });
-  }
-
-  /**
-   * Validate security configuration at startup
-   * Fails fast if environment variables are not properly configured
-   */
-  private async validateSecurityConfiguration(): Promise<void> {
-    try {
-      const { securityConfig } = await import('./security-config.js');
-      const allowedDirs = securityConfig.getAllowedDirectories();
-      
-      // Validate each directory exists and is accessible
-      const fs = await import('fs');
-      
-      for (const dir of allowedDirs) {
-        try {
-          const stat = fs.statSync(dir);
-          if (!stat.isDirectory()) {
-            console.warn(`[WARNING] Allowed path is not a directory: ${dir}`);
-          }
-        } catch (error: any) {
-          console.warn(`[WARNING] Cannot access allowed directory: ${dir} (${error.message})`);
-        }
-      }
-    } catch (error: any) {
-      console.error('SECURITY CONFIGURATION ERROR:', error.message);
-      console.error('Please set the LLM_MCP_ALLOWED_DIRS environment variable in your Claude Desktop configuration.');
-      console.error('Example: "LLM_MCP_ALLOWED_DIRS": "C:\\\\MCP,C:\\\\dev,C:\\\\Users\\\\YourName\\\\Documents"');
-      process.exit(1);
-    }
-  }
-
-  /**
-   * Initialize plugins from directories
-   */
-  private async initializePlugins(): Promise<void> {
-    if (this.pluginsInitialized) return;
-
-    try {
-      console.error('DEBUG: Starting plugin initialization...');
-      
-      // Load plugins from prompts directory
-      const promptsDir = path.join(__dirname, 'prompts');
-      console.error('DEBUG: Loading from:', promptsDir);
-      await this.pluginLoader.loadPlugins(promptsDir);
-      
-      // Load system plugins
-      await this.loadSystemPlugins();
-      
-      this.pluginsInitialized = true;
-      
-      console.error('DEBUG: Plugins initialized successfully');
-      
-    } catch (error) {
-      // Silent error handling to avoid JSON-RPC interference
-      throw error;
-    }
-  }
-
-  /**
-   * Load system plugins from the system directory
-   */
-  private async loadSystemPlugins(): Promise<void> {
-    try {
-      const systemDir = path.join(__dirname, 'system');
-      
-      const files = fs.readdirSync(systemDir);
-      
-      for (const file of files) {
-        if (file.endsWith('.js')) { // Only load .js files, skip .d.ts
-          const filePath = path.join(systemDir, file);
-          await this.loadSystemPlugin(filePath);
-        }
-      }
-    } catch (error) {
-      // Silent error handling to avoid JSON-RPC interference
-      // console.error('[Plugin Server] Error loading system plugins:', error);
-    }
-  }
-
-  /**
-   * Load a single system plugin
-   */
-  private async loadSystemPlugin(filePath: string): Promise<void> {
-    try {
-      // Use ES module dynamic import with proper URL
-      const fileUrl = pathToFileURL(filePath).href;
-      const module = await import(fileUrl);
-      const PluginClass = module.default || module.HealthCheckPlugin || module.PathResolverPlugin || Object.values(module)[0];
-      
-      if (PluginClass && typeof PluginClass === 'function') {
-        const plugin = new PluginClass();
-        this.pluginLoader.registerPlugin(plugin);
-        // Removed console.log to avoid JSON-RPC interference
-      }
-    } catch (error) {
-      // Silent error handling to avoid JSON-RPC interference
-      // console.error(`[Plugin Server] Error loading system plugin ${filePath}:`, error);
-    }
-  }
-
-  /**
-   * Setup MCP request handlers
-   */
-  private setupHandlers(): void {
-    // Tool listing handler - returns plugin-generated tool definitions
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      if (!this.pluginsInitialized) {
-        await this.initializePlugins();
-      }
-      
-      const tools = this.pluginLoader.getPlugins().map(plugin => plugin.getToolDefinition());
-      
-      // Silent operation - no console output
-      return { tools };
-    });
-
-    // Resources handler (empty for now)
-    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: [],
-    }));
-    
-    // Prompts handler (empty for now)
-    this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: [],
-    }));
-
-    // Main tool handler - routes all calls through plugin system
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name: toolName, arguments: args } = request.params;
-      
-      // Silent operation - no console output unless error
-      
-      if (!this.pluginsInitialized) {
-        await this.initializePlugins();
-      }
-      
-      try {
-        // Strip the houtini-lm: prefix to get the actual plugin name
-        const pluginName = toolName.replace(/^houtini-lm:/, '');
-        
-        // Execute plugin
-        const result = await this.pluginLoader.executePlugin(pluginName, args, this.lmStudioClient);
-        
-        // Silent success - no console output
-        
-        // Return standardized MCP response
-        return {
-          content: [
-            {
-              type: 'text',
-              text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
-            }
-          ]
-        };
-        
-      } catch (error: any) {
-        // Silent error handling - only return error response without logging
-        
-        // Return error as MCP response
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                error: true,
-                message: error.message || 'Tool execution failed',
-                tool: toolName,
-                timestamp: new Date().toISOString()
-              }, null, 2)
-            }
-          ]
-        };
-      }
-    });
-  }
-
-  /**
-   * Get plugin statistics
-   */
-  private getPluginStats(): any {
-    const plugins = this.pluginLoader.getPlugins();
-    const categories = {
-      analyze: this.pluginLoader.getPluginsByCategory('analyze').length,
-      generate: this.pluginLoader.getPluginsByCategory('generate').length,
-      system: this.pluginLoader.getPluginsByCategory('system').length
-    };
-
-    return {
-      totalPlugins: plugins.length,
-      categories,
-      pluginNames: plugins.map(p => p.name)
-    };
-  }
-
-  /**
-   * Start the server
-   */
-  async start(): Promise<void> {
-    // SECURITY: Validate configuration before starting server
-    await this.validateSecurityConfiguration();
-    
-    // Silent startup after security validation - no console output to avoid JSON-RPC interference
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    
-    // Server started silently
-  }
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
 }
 
-// Start the server
-const server = new HoutiniLMServer();
-server.start().catch((error) => {
-  // Silent error handling - only exit on critical startup failure
+interface ChatCompletionResponse {
+  id: string;
+  choices: Array<{
+    message: { role: string; content: string };
+    finish_reason: string;
+  }>;
+  model: string;
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+}
+
+async function chatCompletion(
+  messages: ChatMessage[],
+  options: { temperature?: number; maxTokens?: number; model?: string } = {},
+): Promise<ChatCompletionResponse> {
+  const body: Record<string, unknown> = {
+    messages,
+    temperature: options.temperature ?? DEFAULT_TEMPERATURE,
+    max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
+    stream: false,
+  };
+  if (options.model || LM_MODEL) {
+    body.model = options.model || LM_MODEL;
+  }
+
+  const res = await fetch(`${LM_BASE_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`LM Studio API error ${res.status}: ${text}`);
+  }
+
+  return res.json() as Promise<ChatCompletionResponse>;
+}
+
+async function listModels(): Promise<string[]> {
+  const res = await fetch(`${LM_BASE_URL}/v1/models`);
+  if (!res.ok) throw new Error(`Failed to list models: ${res.status}`);
+  const data = (await res.json()) as { data: Array<{ id: string }> };
+  return data.data.map((m) => m.id);
+}
+
+// ── MCP Tool definitions ─────────────────────────────────────────────
+
+const TOOLS = [
+  {
+    name: 'chat',
+    description:
+      'Send a message to the local LLM and get a response. Useful for offloading routine analysis to a local model and preserving Claude context.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        message: { type: 'string', description: 'User message to send' },
+        system: { type: 'string', description: 'Optional system prompt' },
+        temperature: { type: 'number', description: 'Sampling temperature (0–2, default 0.3)' },
+        max_tokens: { type: 'number', description: 'Max tokens in response (default 4096)' },
+      },
+      required: ['message'],
+    },
+  },
+  {
+    name: 'custom_prompt',
+    description:
+      'Run a structured prompt with system message, context, and instruction against the local LLM.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        system: { type: 'string', description: 'System prompt / persona' },
+        context: { type: 'string', description: 'Background context or data to analyse' },
+        instruction: { type: 'string', description: 'What to do with the context' },
+        temperature: { type: 'number', description: 'Sampling temperature (default 0.3)' },
+        max_tokens: { type: 'number', description: 'Max tokens (default 4096)' },
+      },
+      required: ['instruction'],
+    },
+  },
+  {
+    name: 'list_models',
+    description: 'List models currently loaded in LM Studio.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'health_check',
+    description: 'Check connectivity to the local LM Studio instance.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+];
+
+// ── MCP Server ───────────────────────────────────────────────────────
+
+const server = new Server(
+  { name: 'houtini-lm', version: '2.0.0' },
+  { capabilities: { tools: {} } },
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
+    switch (name) {
+      case 'chat': {
+        const { message, system, temperature, max_tokens } = args as {
+          message: string;
+          system?: string;
+          temperature?: number;
+          max_tokens?: number;
+        };
+        const messages: ChatMessage[] = [];
+        if (system) messages.push({ role: 'system', content: system });
+        messages.push({ role: 'user', content: message });
+
+        const resp = await chatCompletion(messages, {
+          temperature,
+          maxTokens: max_tokens,
+        });
+
+        const reply = resp.choices[0]?.message?.content ?? '';
+        const usage = resp.usage
+          ? `\n\n---\nModel: ${resp.model} | Tokens: ${resp.usage.prompt_tokens}→${resp.usage.completion_tokens}`
+          : '';
+
+        return { content: [{ type: 'text', text: reply + usage }] };
+      }
+
+      case 'custom_prompt': {
+        const { system, context, instruction, temperature, max_tokens } = args as {
+          system?: string;
+          context?: string;
+          instruction: string;
+          temperature?: number;
+          max_tokens?: number;
+        };
+
+        const messages: ChatMessage[] = [];
+        if (system) messages.push({ role: 'system', content: system });
+
+        let userContent = instruction;
+        if (context) userContent = `Context:\n${context}\n\nInstruction:\n${instruction}`;
+        messages.push({ role: 'user', content: userContent });
+
+        const resp = await chatCompletion(messages, {
+          temperature,
+          maxTokens: max_tokens,
+        });
+
+        return {
+          content: [{ type: 'text', text: resp.choices[0]?.message?.content ?? '' }],
+        };
+      }
+
+      case 'list_models': {
+        const models = await listModels();
+        return {
+          content: [
+            {
+              type: 'text',
+              text: models.length
+                ? `Loaded models:\n${models.map((m) => `  • ${m}`).join('\n')}`
+                : 'No models currently loaded.',
+            },
+          ],
+        };
+      }
+
+      case 'health_check': {
+        const start = Date.now();
+        const models = await listModels();
+        const ms = Date.now() - start;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Connected to ${LM_BASE_URL} (${ms}ms)\nModels loaded: ${models.length}${models.length ? '\n' + models.join(', ') : ''}`,
+            },
+          ],
+        };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    return {
+      content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true,
+    };
+  }
+});
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write(`Houtini LM server running (${LM_BASE_URL})\n`);
+}
+
+main().catch((error) => {
+  process.stderr.write(`Fatal error: ${error}\n`);
   process.exit(1);
 });
