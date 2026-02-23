@@ -83,14 +83,20 @@ const TOOLS = [
   {
     name: 'chat',
     description:
-      'Send a message to the local LLM and get a response. Useful for offloading routine analysis to a local model and preserving Claude context.',
+      'Delegate a bounded task to the local LLM (Qwen3-Coder, ~3-4 tok/s). ' +
+      'Best for: quick code explanation, pattern recognition, boilerplate generation, knowledge questions. ' +
+      'Use when you can work in parallel — fire this off and continue your own work. ' +
+      'RULES: (1) Always send COMPLETE code, never truncated — the local LLM WILL hallucinate details for missing code. ' +
+      '(2) Set max_tokens to match expected output: 150 for quick answers (~45s), 300 for explanations (~100s), 500 for code generation (~170s). ' +
+      '(3) Be explicit about output format in your message ("respond in 3 bullets", "return only the function"). ' +
+      'DO NOT use for: multi-step reasoning, creative writing, tasks needing >500 token output, or anything requiring tool use (use lm-taskrunner for tool-augmented tasks via mcpo).',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        message: { type: 'string', description: 'User message to send' },
-        system: { type: 'string', description: 'Optional system prompt' },
-        temperature: { type: 'number', description: 'Sampling temperature (0–2, default 0.3)' },
-        max_tokens: { type: 'number', description: 'Max tokens in response (default 4096)' },
+        message: { type: 'string', description: 'The task. Be specific about expected output format and length. Include COMPLETE code — never truncate.' },
+        system: { type: 'string', description: 'Persona for the local LLM. Be specific: "Senior TypeScript dev" not "helpful assistant". Short personas (under 30 words) get best results.' },
+        temperature: { type: 'number', description: '0.1 for factual/code tasks, 0.3 for analysis (default), 0.7 for creative suggestions. Stay under 0.5 for code.' },
+        max_tokens: { type: 'number', description: 'Cap this to match expected output. 150=quick answer, 300=explanation, 500=code generation. Lower = faster. Default 4096 is almost always too high.' },
       },
       required: ['message'],
     },
@@ -98,27 +104,53 @@ const TOOLS = [
   {
     name: 'custom_prompt',
     description:
-      'Run a structured prompt with system message, context, and instruction against the local LLM.',
+      'Structured analysis on the local LLM with explicit system/context/instruction separation. ' +
+      'This 3-part format gets the best results from local models — the separation prevents context bleed. ' +
+      'System sets persona (be specific: "Senior TypeScript dev reviewing for security bugs"). ' +
+      'Context provides COMPLETE data (full source file, full error log — never truncated). ' +
+      'Instruction states exactly what to produce (under 50 words for best results). ' +
+      'Best for: code review, comparison, refactoring suggestions, structured analysis. ' +
+      'Expect 30-180s response time depending on max_tokens.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        system: { type: 'string', description: 'System prompt / persona' },
-        context: { type: 'string', description: 'Background context or data to analyse' },
-        instruction: { type: 'string', description: 'What to do with the context' },
-        temperature: { type: 'number', description: 'Sampling temperature (default 0.3)' },
-        max_tokens: { type: 'number', description: 'Max tokens (default 4096)' },
+        system: { type: 'string', description: 'Persona. Be specific and under 30 words. Example: "Expert Node.js developer focused on error handling and edge cases."' },
+        context: { type: 'string', description: 'The COMPLETE data to analyse. Full source code, full logs, full text. NEVER truncate — the local LLM fills gaps with plausible hallucinations.' },
+        instruction: { type: 'string', description: 'What to produce. Under 50 words. Specify format: "List 3 bugs as bullet points" or "Return a JSON array of {line, issue, fix}".' },
+        temperature: { type: 'number', description: '0.1 for bugs/review, 0.3 for analysis (default), 0.5 for suggestions.' },
+        max_tokens: { type: 'number', description: 'Match to expected output. 200 for bullets, 400 for detailed review, 600 for code generation.' },
       },
       required: ['instruction'],
     },
   },
   {
+    name: 'code_task',
+    description:
+      'Purpose-built for code analysis tasks. Wraps the local LLM with an optimised code-review system prompt. ' +
+      'Provide COMPLETE source code and a specific task — returns analysis in ~30-180s. ' +
+      'Ideal for parallel execution: delegate to local LLM while you handle other work. ' +
+      'The local LLM excels at: explaining code, finding common bugs, suggesting improvements, comparing patterns, generating boilerplate. ' +
+      'It struggles with: subtle/adversarial bugs, multi-file reasoning, design tasks requiring integration. ' +
+      'Output capped at 500 tokens by default (override with max_tokens).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: { type: 'string', description: 'COMPLETE source code. Never truncate. Include imports and full function bodies.' },
+        task: { type: 'string', description: 'What to do. Be specific and concise: "Find bugs", "Explain this function", "Add error handling to fetchData", "Compare these two approaches".' },
+        language: { type: 'string', description: 'Programming language for context: "typescript", "python", "rust", etc.' },
+        max_tokens: { type: 'number', description: 'Expected output size. Default 500. Use 200 for quick answers, 800 for code generation.' },
+      },
+      required: ['code', 'task'],
+    },
+  },
+  {
     name: 'list_models',
-    description: 'List models currently loaded in LM Studio.',
+    description: 'List models currently loaded in LM Studio. Use to verify which model will handle delegated tasks.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
     name: 'health_check',
-    description: 'Check connectivity to the local LM Studio instance.',
+    description: 'Check connectivity and latency to the local LM Studio instance. Run before delegating time-sensitive tasks.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
 ];
@@ -126,7 +158,7 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.0.1' },
+  { name: 'houtini-lm', version: '2.1.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -185,6 +217,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: 'text', text: resp.choices[0]?.message?.content ?? '' }],
         };
+      }
+
+      case 'code_task': {
+        const { code, task, language, max_tokens: codeMaxTokens } = args as {
+          code: string;
+          task: string;
+          language?: string;
+          max_tokens?: number;
+        };
+
+        const lang = language || 'unknown';
+        const codeMessages: ChatMessage[] = [
+          {
+            role: 'system',
+            content: `Expert ${lang} developer. Analyse the provided code and complete the task. Be specific — reference line numbers, function names, and concrete fixes. No preamble.`,
+          },
+          {
+            role: 'user',
+            content: `Task: ${task}\n\n\`\`\`${lang}\n${code}\n\`\`\``,
+          },
+        ];
+
+        const codeResp = await chatCompletion(codeMessages, {
+          temperature: 0.2,
+          maxTokens: codeMaxTokens ?? 500,
+        });
+
+        const codeReply = codeResp.choices[0]?.message?.content ?? '';
+        const codeUsage = codeResp.usage
+          ? `\n\n---\nModel: ${codeResp.model} | Tokens: ${codeResp.usage.prompt_tokens}→${codeResp.usage.completion_tokens} | ${lang}`
+          : '';
+
+        return { content: [{ type: 'text', text: codeReply + codeUsage }] };
       }
 
       case 'list_models': {
