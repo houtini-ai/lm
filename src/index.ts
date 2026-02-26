@@ -3,7 +3,7 @@
  * Houtini LM — MCP Server for Local LLMs via OpenAI-compatible API
  *
  * Connects to LM Studio (or any OpenAI-compatible endpoint) and exposes
- * chat, custom prompts, and model info as MCP tools.
+ * chat, custom prompts, code tasks, and model discovery as MCP tools.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -16,8 +16,13 @@ import {
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
 const LM_PASSWORD = process.env.LM_STUDIO_PASSWORD || '';
-const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_MAX_TOKENS = 2048;
 const DEFAULT_TEMPERATURE = 0.3;
+const CONNECT_TIMEOUT_MS = 5000;
+const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
+const SOFT_TIMEOUT_MS = 55_000;              // return partial results before MCP SDK ~60s timeout
+const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk
+const FALLBACK_CONTEXT_LENGTH = parseInt(process.env.LM_CONTEXT_WINDOW || '100000', 10);
 
 function apiHeaders(): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -32,49 +37,191 @@ interface ChatMessage {
   content: string;
 }
 
-interface ChatCompletionResponse {
-  id: string;
-  choices: Array<{
-    message: { role: string; content: string };
-    finish_reason: string;
-  }>;
+interface StreamingResult {
+  content: string;
   model: string;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  finishReason: string;
+  truncated: boolean;
 }
 
-async function chatCompletion(
+interface ModelInfo {
+  id: string;
+  context_length?: number;
+  max_model_len?: number;
+  owned_by?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Fetch with a connect timeout so Claude doesn't hang when the host is offline.
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number = CONNECT_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Read from a stream with a per-chunk timeout.
+ * Prevents hanging forever if the LLM stalls mid-generation.
+ */
+async function timedRead(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): Promise<{ done: boolean; value?: Uint8Array } | 'timeout'> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+  });
+  try {
+    return await Promise.race([reader.read(), timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
+/**
+ * Streaming chat completion with soft timeout.
+ *
+ * Uses SSE streaming (`stream: true`) so tokens arrive incrementally.
+ * If we approach the MCP SDK's ~60s timeout (soft limit at 55s), we
+ * return whatever content we have so far with `truncated: true`.
+ * This means large code reviews return partial results instead of nothing.
+ */
+async function chatCompletionStreaming(
   messages: ChatMessage[],
   options: { temperature?: number; maxTokens?: number; model?: string } = {},
-): Promise<ChatCompletionResponse> {
+): Promise<StreamingResult> {
   const body: Record<string, unknown> = {
     messages,
     temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
-    stream: false,
+    stream: true,
   };
   if (options.model || LM_MODEL) {
     body.model = options.model || LM_MODEL;
   }
 
-  const res = await fetch(`${LM_BASE_URL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: apiHeaders(),
-    body: JSON.stringify(body),
-  });
+  const startTime = Date.now();
+
+  const res = await fetchWithTimeout(
+    `${LM_BASE_URL}/v1/chat/completions`,
+    { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
+    INFERENCE_CONNECT_TIMEOUT_MS,
+  );
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`LM Studio API error ${res.status}: ${text}`);
   }
 
-  return res.json() as Promise<ChatCompletionResponse>;
+  if (!res.body) {
+    throw new Error('Response body is null — streaming not supported by endpoint');
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let content = '';
+  let model = '';
+  let usage: StreamingResult['usage'];
+  let finishReason = '';
+  let truncated = false;
+  let buffer = '';
+
+  try {
+    while (true) {
+      // Check soft timeout before each read
+      const elapsed = Date.now() - startTime;
+      if (elapsed > SOFT_TIMEOUT_MS) {
+        truncated = true;
+        process.stderr.write(`[houtini-lm] Soft timeout at ${elapsed}ms, returning ${content.length} chars of partial content\n`);
+        break;
+      }
+
+      // Read with per-chunk timeout (handles stalled generation)
+      const remaining = SOFT_TIMEOUT_MS - elapsed;
+      const chunkTimeout = Math.min(READ_CHUNK_TIMEOUT_MS, remaining);
+      const result = await timedRead(reader, chunkTimeout);
+
+      if (result === 'timeout') {
+        truncated = true;
+        process.stderr.write(`[houtini-lm] Chunk read timeout, returning ${content.length} chars of partial content\n`);
+        break;
+      }
+
+      if (result.done) break;
+
+      buffer += decoder.decode(result.value, { stream: true });
+
+      // Parse SSE lines
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === 'data: [DONE]') continue;
+        if (!trimmed.startsWith('data: ')) continue;
+
+        try {
+          const json = JSON.parse(trimmed.slice(6));
+          if (json.model) model = json.model;
+
+          const delta = json.choices?.[0]?.delta;
+          if (delta?.content) content += delta.content;
+
+          const reason = json.choices?.[0]?.finish_reason;
+          if (reason) finishReason = reason;
+
+          // Some endpoints include usage in the final streaming chunk
+          if (json.usage) usage = json.usage;
+        } catch {
+          // Skip unparseable chunks (partial JSON, comments, etc.)
+        }
+      }
+    }
+  } finally {
+    // Release the reader — don't await cancel() as it can hang
+    reader.releaseLock();
+  }
+
+  return { content, model, usage, finishReason, truncated };
 }
 
-async function listModels(): Promise<string[]> {
-  const res = await fetch(`${LM_BASE_URL}/v1/models`, { headers: apiHeaders() });
+async function listModelsRaw(): Promise<ModelInfo[]> {
+  const res = await fetchWithTimeout(
+    `${LM_BASE_URL}/v1/models`,
+    { headers: apiHeaders() },
+  );
   if (!res.ok) throw new Error(`Failed to list models: ${res.status}`);
-  const data = (await res.json()) as { data: Array<{ id: string }> };
-  return data.data.map((m) => m.id);
+  const data = (await res.json()) as { data: ModelInfo[] };
+  return data.data;
+}
+
+function getContextLength(model: ModelInfo): number {
+  // LM Studio uses context_length, vLLM uses max_model_len, fall back to env/100k
+  return model.context_length ?? model.max_model_len ?? FALLBACK_CONTEXT_LENGTH;
+}
+
+/**
+ * Format a footer line for streaming results showing model, usage, and truncation status.
+ */
+function formatFooter(resp: StreamingResult, extra?: string): string {
+  const parts: string[] = [];
+  if (resp.model) parts.push(`Model: ${resp.model}`);
+  if (resp.usage) parts.push(`Tokens: ${resp.usage.prompt_tokens}→${resp.usage.completion_tokens}`);
+  if (extra) parts.push(extra);
+  if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
+
+  return parts.length > 0 ? `\n\n---\n${parts.join(' | ')}` : '';
 }
 
 // ── MCP Tool definitions ─────────────────────────────────────────────
@@ -83,20 +230,41 @@ const TOOLS = [
   {
     name: 'chat',
     description:
-      'Delegate a bounded task to the local LLM (Qwen3-Coder, ~3-4 tok/s). ' +
-      'Best for: quick code explanation, pattern recognition, boilerplate generation, knowledge questions. ' +
-      'Use when you can work in parallel — fire this off and continue your own work. ' +
-      'RULES: (1) Always send COMPLETE code, never truncated — the local LLM WILL hallucinate details for missing code. ' +
-      '(2) Set max_tokens to match expected output: 150 for quick answers (~45s), 300 for explanations (~100s), 500 for code generation (~170s). ' +
-      '(3) Be explicit about output format in your message ("respond in 3 bullets", "return only the function"). ' +
-      'DO NOT use for: multi-step reasoning, creative writing, tasks needing >500 token output, or anything requiring tool use (use lm-taskrunner for tool-augmented tasks via mcpo).',
+      'Send a task to a local LLM running on a separate machine. This is a FREE, parallel worker — ' +
+      'use it to offload bounded work while you continue doing other things. The local LLM runs independently ' +
+      'and does not consume your tokens or rate limits.\n\n' +
+      'WHEN TO USE (delegate generously — it costs nothing):\n' +
+      '• Explain or summarise code/docs you just read\n' +
+      '• Generate boilerplate, test stubs, type definitions, mock data\n' +
+      '• Answer factual questions about languages, frameworks, APIs\n' +
+      '• Draft commit messages, PR descriptions, comments\n' +
+      '• Translate or reformat content (JSON↔YAML, snake_case↔camelCase)\n' +
+      '• Brainstorm approaches before you commit to one\n' +
+      '• Any self-contained subtask that does not need tool access\n\n' +
+      'RULES:\n' +
+      '(1) Always send COMPLETE code/context — never truncate, the local LLM cannot access files.\n' +
+      '(2) Be explicit about output format ("respond as a JSON array", "return only the function").\n' +
+      '(3) Call discover first if you are unsure whether the local LLM is online.\n\n' +
+      'The local model, context window, and speed vary — call the discover tool to check what is loaded.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        message: { type: 'string', description: 'The task. Be specific about expected output format and length. Include COMPLETE code — never truncate.' },
-        system: { type: 'string', description: 'Persona for the local LLM. Be specific: "Senior TypeScript dev" not "helpful assistant". Short personas (under 30 words) get best results.' },
-        temperature: { type: 'number', description: '0.1 for factual/code tasks, 0.3 for analysis (default), 0.7 for creative suggestions. Stay under 0.5 for code.' },
-        max_tokens: { type: 'number', description: 'Cap this to match expected output. 150=quick answer, 300=explanation, 500=code generation. Lower = faster. Default 4096 is almost always too high.' },
+        message: {
+          type: 'string',
+          description: 'The task. Be specific about expected output format. Include COMPLETE code/context — never truncate.',
+        },
+        system: {
+          type: 'string',
+          description: 'Persona for the local LLM. Be specific: "Senior TypeScript dev" not "helpful assistant".',
+        },
+        temperature: {
+          type: 'number',
+          description: '0.1 for factual/code, 0.3 for analysis (default), 0.7 for creative. Stay under 0.5 for code.',
+        },
+        max_tokens: {
+          type: 'number',
+          description: 'Max response tokens. Default 2048. Use higher for code generation, lower for quick answers.',
+        },
       },
       required: ['message'],
     },
@@ -104,21 +272,39 @@ const TOOLS = [
   {
     name: 'custom_prompt',
     description:
-      'Structured analysis on the local LLM with explicit system/context/instruction separation. ' +
-      'This 3-part format gets the best results from local models — the separation prevents context bleed. ' +
-      'System sets persona (be specific: "Senior TypeScript dev reviewing for security bugs"). ' +
-      'Context provides COMPLETE data (full source file, full error log — never truncated). ' +
-      'Instruction states exactly what to produce (under 50 words for best results). ' +
-      'Best for: code review, comparison, refactoring suggestions, structured analysis. ' +
-      'Expect 30-180s response time depending on max_tokens.',
+      'Structured analysis via the local LLM with explicit system/context/instruction separation. ' +
+      'This 3-part format prevents context bleed and gets the best results from local models.\n\n' +
+      'WHEN TO USE:\n' +
+      '• Code review — paste full source, ask for bugs/improvements\n' +
+      '• Comparison — paste two implementations, ask which is better and why\n' +
+      '• Refactoring suggestions — paste code, ask for a cleaner version\n' +
+      '• Content analysis — paste text, ask for structure/tone/issues\n' +
+      '• Any task where separating context from instruction improves clarity\n\n' +
+      'System sets persona. Context provides COMPLETE data (never truncate). ' +
+      'Instruction states exactly what to produce.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        system: { type: 'string', description: 'Persona. Be specific and under 30 words. Example: "Expert Node.js developer focused on error handling and edge cases."' },
-        context: { type: 'string', description: 'The COMPLETE data to analyse. Full source code, full logs, full text. NEVER truncate — the local LLM fills gaps with plausible hallucinations.' },
-        instruction: { type: 'string', description: 'What to produce. Under 50 words. Specify format: "List 3 bugs as bullet points" or "Return a JSON array of {line, issue, fix}".' },
-        temperature: { type: 'number', description: '0.1 for bugs/review, 0.3 for analysis (default), 0.5 for suggestions.' },
-        max_tokens: { type: 'number', description: 'Match to expected output. 200 for bullets, 400 for detailed review, 600 for code generation.' },
+        system: {
+          type: 'string',
+          description: 'Persona. Be specific: "Expert Node.js developer focused on error handling and edge cases."',
+        },
+        context: {
+          type: 'string',
+          description: 'The COMPLETE data to analyse. Full source code, full logs, full text. NEVER truncate.',
+        },
+        instruction: {
+          type: 'string',
+          description: 'What to produce. Specify format: "List 3 bugs as bullet points" or "Return a JSON array of {line, issue, fix}".',
+        },
+        temperature: {
+          type: 'number',
+          description: '0.1 for bugs/review, 0.3 for analysis (default), 0.5 for suggestions.',
+        },
+        max_tokens: {
+          type: 'number',
+          description: 'Max response tokens. Default 2048.',
+        },
       },
       required: ['instruction'],
     },
@@ -126,31 +312,50 @@ const TOOLS = [
   {
     name: 'code_task',
     description:
-      'Purpose-built for code analysis tasks. Wraps the local LLM with an optimised code-review system prompt. ' +
-      'Provide COMPLETE source code and a specific task — returns analysis in ~30-180s. ' +
-      'Ideal for parallel execution: delegate to local LLM while you handle other work. ' +
-      'The local LLM excels at: explaining code, finding common bugs, suggesting improvements, comparing patterns, generating boilerplate. ' +
-      'It struggles with: subtle/adversarial bugs, multi-file reasoning, design tasks requiring integration. ' +
-      'Output capped at 500 tokens by default (override with max_tokens).',
+      'Send a code analysis task to the local LLM. Wraps the request with an optimised code-review system prompt.\n\n' +
+      'WHEN TO USE:\n' +
+      '• Explain what a function/class does\n' +
+      '• Find bugs or suggest improvements\n' +
+      '• Generate unit tests or type definitions for existing code\n' +
+      '• Add error handling, logging, or validation\n' +
+      '• Convert between languages or patterns\n\n' +
+      'Provide COMPLETE source code (the local LLM cannot read files) and a specific task.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        code: { type: 'string', description: 'COMPLETE source code. Never truncate. Include imports and full function bodies.' },
-        task: { type: 'string', description: 'What to do. Be specific and concise: "Find bugs", "Explain this function", "Add error handling to fetchData", "Compare these two approaches".' },
-        language: { type: 'string', description: 'Programming language for context: "typescript", "python", "rust", etc.' },
-        max_tokens: { type: 'number', description: 'Expected output size. Default 500. Use 200 for quick answers, 800 for code generation.' },
+        code: {
+          type: 'string',
+          description: 'COMPLETE source code. Never truncate. Include imports and full function bodies.',
+        },
+        task: {
+          type: 'string',
+          description: 'What to do: "Find bugs", "Explain this", "Add error handling to fetchData", "Write tests".',
+        },
+        language: {
+          type: 'string',
+          description: 'Programming language: "typescript", "python", "rust", etc.',
+        },
+        max_tokens: {
+          type: 'number',
+          description: 'Max response tokens. Default 2048.',
+        },
       },
       required: ['code', 'task'],
     },
   },
   {
-    name: 'list_models',
-    description: 'List models currently loaded in LM Studio. Use to verify which model will handle delegated tasks.',
+    name: 'discover',
+    description:
+      'Check whether the local LLM is online and what model is loaded. Returns model name, context window size, ' +
+      'and response latency. Call this if you are unsure whether the local LLM is available before delegating work. ' +
+      'Fast — typically responds in under 1 second, or returns an offline status within 5 seconds if the host is unreachable.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
-    name: 'health_check',
-    description: 'Check connectivity and latency to the local LM Studio instance. Run before delegating time-sensitive tasks.',
+    name: 'list_models',
+    description:
+      'List all models currently loaded in the local LLM server, with context window sizes. ' +
+      'Use discover instead for a quick availability check.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
 ];
@@ -158,7 +363,7 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.1.0' },
+  { name: 'houtini-lm', version: '2.3.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -180,17 +385,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (system) messages.push({ role: 'system', content: system });
         messages.push({ role: 'user', content: message });
 
-        const resp = await chatCompletion(messages, {
+        const resp = await chatCompletionStreaming(messages, {
           temperature,
           maxTokens: max_tokens,
         });
 
-        const reply = resp.choices[0]?.message?.content ?? '';
-        const usage = resp.usage
-          ? `\n\n---\nModel: ${resp.model} | Tokens: ${resp.usage.prompt_tokens}→${resp.usage.completion_tokens}`
-          : '';
-
-        return { content: [{ type: 'text', text: reply + usage }] };
+        const footer = formatFooter(resp);
+        return { content: [{ type: 'text', text: resp.content + footer }] };
       }
 
       case 'custom_prompt': {
@@ -209,13 +410,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (context) userContent = `Context:\n${context}\n\nInstruction:\n${instruction}`;
         messages.push({ role: 'user', content: userContent });
 
-        const resp = await chatCompletion(messages, {
+        const resp = await chatCompletionStreaming(messages, {
           temperature,
           maxTokens: max_tokens,
         });
 
+        const footer = formatFooter(resp);
         return {
-          content: [{ type: 'text', text: resp.choices[0]?.message?.content ?? '' }],
+          content: [{ type: 'text', text: resp.content + footer }],
         };
       }
 
@@ -239,44 +441,77 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         ];
 
-        const codeResp = await chatCompletion(codeMessages, {
+        const codeResp = await chatCompletionStreaming(codeMessages, {
           temperature: 0.2,
-          maxTokens: codeMaxTokens ?? 500,
+          maxTokens: codeMaxTokens ?? DEFAULT_MAX_TOKENS,
         });
 
-        const codeReply = codeResp.choices[0]?.message?.content ?? '';
-        const codeUsage = codeResp.usage
-          ? `\n\n---\nModel: ${codeResp.model} | Tokens: ${codeResp.usage.prompt_tokens}→${codeResp.usage.completion_tokens} | ${lang}`
-          : '';
-
-        return { content: [{ type: 'text', text: codeReply + codeUsage }] };
+        const codeFooter = formatFooter(codeResp, lang);
+        return { content: [{ type: 'text', text: codeResp.content + codeFooter }] };
       }
 
-      case 'list_models': {
-        const models = await listModels();
-        return {
-          content: [
-            {
+      case 'discover': {
+        const start = Date.now();
+        let models: ModelInfo[];
+        try {
+          models = await listModelsRaw();
+        } catch (err) {
+          const ms = Date.now() - start;
+          const reason = err instanceof Error && err.name === 'AbortError'
+            ? `Host unreachable (timed out after ${ms}ms)`
+            : `Connection failed: ${err instanceof Error ? err.message : String(err)}`;
+          return {
+            content: [{
               type: 'text',
-              text: models.length
-                ? `Loaded models:\n${models.map((m) => `  • ${m}`).join('\n')}`
-                : 'No models currently loaded.',
-            },
-          ],
+              text: `Status: OFFLINE\nEndpoint: ${LM_BASE_URL}\n${reason}\n\nThe local LLM is not available right now. Do not attempt to delegate tasks to it.`,
+            }],
+          };
+        }
+        const ms = Date.now() - start;
+
+        if (models.length === 0) {
+          return {
+            content: [{
+              type: 'text',
+              text: `Status: ONLINE (no model loaded)\nEndpoint: ${LM_BASE_URL}\nLatency: ${ms}ms\n\nThe server is running but no model is loaded. Ask the user to load a model in LM Studio.`,
+            }],
+          };
+        }
+
+        const lines = models.map((m) => {
+          const ctx = getContextLength(m);
+          return `  • ${m.id} (context: ${ctx.toLocaleString()} tokens)`;
+        });
+
+        const primary = models[0];
+        const ctx = getContextLength(primary);
+
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `Status: ONLINE\n` +
+              `Endpoint: ${LM_BASE_URL}\n` +
+              `Latency: ${ms}ms\n` +
+              `Model: ${primary.id}\n` +
+              `Context window: ${ctx.toLocaleString()} tokens\n` +
+              `\nLoaded models:\n${lines.join('\n')}\n\n` +
+              `The local LLM is available. You can delegate tasks using chat, custom_prompt, or code_task.`,
+          }],
         };
       }
 
-      case 'health_check': {
-        const start = Date.now();
-        const models = await listModels();
-        const ms = Date.now() - start;
+      case 'list_models': {
+        const models = await listModelsRaw();
+        if (!models.length) {
+          return { content: [{ type: 'text', text: 'No models currently loaded.' }] };
+        }
+        const lines = models.map((m) => {
+          const ctx = getContextLength(m);
+          return `  • ${m.id}${ctx ? ` (context: ${ctx.toLocaleString()} tokens)` : ''}`;
+        });
         return {
-          content: [
-            {
-              type: 'text',
-              text: `Connected to ${LM_BASE_URL} (${ms}ms)\nAuth: ${LM_PASSWORD ? 'enabled' : 'none'}\nModels loaded: ${models.length}${models.length ? '\n' + models.join(', ') : ''}`,
-            },
-          ],
+          content: [{ type: 'text', text: `Loaded models:\n${lines.join('\n')}` }],
         };
       }
 
