@@ -24,6 +24,31 @@ const SOFT_TIMEOUT_MS = 55_000;              // return partial results before MC
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk
 const FALLBACK_CONTEXT_LENGTH = parseInt(process.env.LM_CONTEXT_WINDOW || '100000', 10);
 
+// ── Session-level token accounting ───────────────────────────────────
+// Tracks cumulative tokens offloaded to the local LLM across all calls
+// in this session. Shown in every response footer so Claude can reason
+// about cost savings and continue delegating strategically.
+
+const session = {
+  calls: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+};
+
+function recordUsage(usage?: { prompt_tokens: number; completion_tokens: number }) {
+  session.calls++;
+  if (usage) {
+    session.promptTokens += usage.prompt_tokens;
+    session.completionTokens += usage.completion_tokens;
+  }
+}
+
+function sessionSummary(): string {
+  const total = session.promptTokens + session.completionTokens;
+  if (session.calls === 0) return '';
+  return `Session: ${total.toLocaleString()} tokens offloaded across ${session.calls} call${session.calls === 1 ? '' : 's'}`;
+}
+
 function apiHeaders(): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
   if (LM_PASSWORD) h['Authorization'] = `Bearer ${LM_PASSWORD}`;
@@ -215,11 +240,17 @@ function getContextLength(model: ModelInfo): number {
  * Format a footer line for streaming results showing model, usage, and truncation status.
  */
 function formatFooter(resp: StreamingResult, extra?: string): string {
+  // Record usage for session tracking before formatting
+  recordUsage(resp.usage);
+
   const parts: string[] = [];
   if (resp.model) parts.push(`Model: ${resp.model}`);
-  if (resp.usage) parts.push(`Tokens: ${resp.usage.prompt_tokens}→${resp.usage.completion_tokens}`);
+  if (resp.usage) parts.push(`This call: ${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
   if (extra) parts.push(extra);
   if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
+
+  const sessionLine = sessionSummary();
+  if (sessionLine) parts.push(sessionLine);
 
   return parts.length > 0 ? `\n\n---\n${parts.join(' | ')}` : '';
 }
@@ -233,6 +264,9 @@ const TOOLS = [
       'Send a task to a local LLM running on a separate machine. This is a FREE, parallel worker — ' +
       'use it to offload bounded work while you continue doing other things. The local LLM runs independently ' +
       'and does not consume your tokens or rate limits.\n\n' +
+      'PLANNING: When you start a large task (refactoring, migrations, test suites, documentation), ' +
+      'break it into steps and identify which ones are bounded grunt work you can delegate here. ' +
+      'The more you offload, the more tokens you save. The session footer tracks cumulative savings.\n\n' +
       'WHEN TO USE (delegate generously — it costs nothing):\n' +
       '• Explain or summarise code/docs you just read\n' +
       '• Generate boilerplate, test stubs, type definitions, mock data\n' +
@@ -241,10 +275,14 @@ const TOOLS = [
       '• Translate or reformat content (JSON↔YAML, snake_case↔camelCase)\n' +
       '• Brainstorm approaches before you commit to one\n' +
       '• Any self-contained subtask that does not need tool access\n\n' +
-      'RULES:\n' +
+      'PROMPT QUALITY (the local model is highly capable — results depend on your prompt):\n' +
       '(1) Always send COMPLETE code/context — never truncate, the local LLM cannot access files.\n' +
       '(2) Be explicit about output format ("respond as a JSON array", "return only the function").\n' +
-      '(3) Call discover first if you are unsure whether the local LLM is online.\n\n' +
+      '(3) Set a specific persona in the system field — "Senior TypeScript dev" beats "helpful assistant".\n' +
+      '(4) State constraints: "no preamble", "reference line numbers", "max 5 bullet points".\n' +
+      '(5) For code generation, include the surrounding context (imports, types, function signatures).\n\n' +
+      'QA: Always review the local LLM\'s output before using it. Verify correctness, check edge cases, ' +
+      'and fix any issues. You are the architect — the local model is a fast drafter, not the final authority.\n\n' +
       'The local model, context window, and speed vary — call the discover tool to check what is loaded.',
     inputSchema: {
       type: 'object' as const,
@@ -274,14 +312,19 @@ const TOOLS = [
     description:
       'Structured analysis via the local LLM with explicit system/context/instruction separation. ' +
       'This 3-part format prevents context bleed and gets the best results from local models.\n\n' +
+      'USE THIS for complex tasks where prompt structure matters — it consistently outperforms ' +
+      'stuffing everything into a single message. The separation helps the local model focus.\n\n' +
       'WHEN TO USE:\n' +
       '• Code review — paste full source, ask for bugs/improvements\n' +
       '• Comparison — paste two implementations, ask which is better and why\n' +
       '• Refactoring suggestions — paste code, ask for a cleaner version\n' +
       '• Content analysis — paste text, ask for structure/tone/issues\n' +
       '• Any task where separating context from instruction improves clarity\n\n' +
-      'System sets persona. Context provides COMPLETE data (never truncate). ' +
-      'Instruction states exactly what to produce.',
+      'PROMPT STRUCTURE (each field has a job — keep them focused):\n' +
+      '• System: persona + constraints, under 30 words. "Expert Python developer focused on performance and correctness."\n' +
+      '• Context: COMPLETE data. Full source code, full logs, full text. NEVER truncate or summarise.\n' +
+      '• Instruction: exactly what to produce, under 50 words. Specify format: "Return a JSON array of {line, issue, fix}."\n\n' +
+      'QA: Review the output. The local model is a capable drafter — verify its analysis before acting on it.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -313,13 +356,20 @@ const TOOLS = [
     name: 'code_task',
     description:
       'Send a code analysis task to the local LLM. Wraps the request with an optimised code-review system prompt.\n\n' +
+      'This is the fastest way to offload code-specific work. Temperature is locked to 0.2 for ' +
+      'focused, deterministic output. The system prompt is pre-configured for code review.\n\n' +
       'WHEN TO USE:\n' +
       '• Explain what a function/class does\n' +
       '• Find bugs or suggest improvements\n' +
       '• Generate unit tests or type definitions for existing code\n' +
       '• Add error handling, logging, or validation\n' +
       '• Convert between languages or patterns\n\n' +
-      'Provide COMPLETE source code (the local LLM cannot read files) and a specific task.',
+      'GETTING BEST RESULTS:\n' +
+      '• Provide COMPLETE source code — the local LLM cannot read files.\n' +
+      '• Include imports and type definitions so the model has full context.\n' +
+      '• Be specific in the task: "Write 3 Jest tests for the error paths in fetchUser" beats "Write tests".\n' +
+      '• Set the language field — it shapes the system prompt and improves accuracy.\n\n' +
+      'QA: Always verify generated code compiles, handles edge cases, and follows project conventions.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -347,7 +397,8 @@ const TOOLS = [
     name: 'discover',
     description:
       'Check whether the local LLM is online and what model is loaded. Returns model name, context window size, ' +
-      'and response latency. Call this if you are unsure whether the local LLM is available before delegating work. ' +
+      'response latency, and cumulative session stats (tokens offloaded so far). ' +
+      'Call this if you are unsure whether the local LLM is available before delegating work. ' +
       'Fast — typically responds in under 1 second, or returns an offline status within 5 seconds if the host is unreachable.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
@@ -363,7 +414,7 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.3.0' },
+  { name: 'houtini-lm', version: '2.4.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -486,6 +537,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const primary = models[0];
         const ctx = getContextLength(primary);
 
+        const sessionStats = session.calls > 0
+          ? `\nSession stats: ${(session.promptTokens + session.completionTokens).toLocaleString()} tokens offloaded across ${session.calls} call${session.calls === 1 ? '' : 's'}`
+          : '\nSession stats: no calls yet — delegate tasks to start saving tokens';
+
         return {
           content: [{
             type: 'text',
@@ -495,7 +550,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               `Latency: ${ms}ms\n` +
               `Model: ${primary.id}\n` +
               `Context window: ${ctx.toLocaleString()} tokens\n` +
-              `\nLoaded models:\n${lines.join('\n')}\n\n` +
+              `\nLoaded models:\n${lines.join('\n')}` +
+              `${sessionStats}\n\n` +
               `The local LLM is available. You can delegate tasks using chat, custom_prompt, or code_task.`,
           }],
         };
