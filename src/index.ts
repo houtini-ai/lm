@@ -414,7 +414,7 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.4.0' },
+  { name: 'houtini-lm', version: '2.4.1' },
   { capabilities: { tools: {} } },
 );
 
