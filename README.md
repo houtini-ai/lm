@@ -3,6 +3,12 @@
 [![npm version](https://img.shields.io/npm/v/@houtini/lm)](https://www.npmjs.com/package/@houtini/lm)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/@houtini-ai/lm">
+    <img width="380" height="200" src="https://glama.ai/mcp/servers/@houtini-ai/lm/badge" alt="Houtini LM MCP server" />
+  </a>
+</p>
+
 I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, explaining code, drafting commit messages, converting formats. Stuff that doesn't need Claude's reasoning or tool access.
 
 Houtini LM connects Claude Code to a local LLM on your network. Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to your local model. Free. No rate limits. Private.
