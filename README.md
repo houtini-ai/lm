@@ -1,4 +1,4 @@
-# @houtini/lm
+# @houtini/lm Houtini LM - Offload Tasks to Your Local LLM Server
 
 [![npm version](https://img.shields.io/npm/v/@houtini/lm)](https://www.npmjs.com/package/@houtini/lm)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
