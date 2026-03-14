@@ -4,8 +4,8 @@
  * Tests the underlying OpenAI-compatible API on hopper:1234
  */
 
-const BASE = 'http://hopper:1234';
-const MODEL = 'qwen/qwen3-coder-next';
+const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';
+let MODEL = process.env.LM_STUDIO_MODEL || '';
 
 let passed = 0;
 let failed = 0;
@@ -48,7 +48,6 @@ async function chat(messages, opts = {}) {
 
 console.log('\n=== Houtini LM Test Suite ===\n');
 console.log(`Target: ${BASE}`);
-console.log(`Model:  ${MODEL}\n`);
 
 // ── Health & Models ─────────────────────────────────────────────
 console.log('--- Health & Models ---');
@@ -57,14 +56,13 @@ await test('List models endpoint', async () => {
   const res = await fetch(`${BASE}/v1/models`);
   const data = await res.json();
   if (!data.data || data.data.length === 0) throw new Error('No models');
+  // Auto-detect model if not set
+  if (!MODEL) {
+    const loaded = data.data.find(m => m.state === 'loaded');
+    MODEL = loaded?.id || data.data[0].id;
+  }
+  console.log(`Model:  ${MODEL}\n`);
   return `${data.data.length} models available`;
-});
-
-await test('Target model exists', async () => {
-  const res = await fetch(`${BASE}/v1/models`);
-  const data = await res.json();
-  const found = data.data.find(m => m.id === MODEL);
-  if (!found) throw new Error(`Model ${MODEL} not found`);
 });
 
 // ── Basic Chat ──────────────────────────────────────────────────

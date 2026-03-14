@@ -17,6 +17,8 @@ import {
   getCachedProfile,
   toModelProfile as cachedToProfile,
   getHFEnrichmentLine,
+  getPromptHints,
+  type PromptHints,
 } from './model-cache.js';
 
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
@@ -40,7 +42,7 @@ const session = {
   promptTokens: 0,
   completionTokens: 0,
   /** Per-model performance tracking for routing insights */
-  modelStats: new Map<string, { calls: number; totalTtftMs: number; totalTokPerSec: number }>(),
+  modelStats: new Map<string, { calls: number; perfCalls: number; totalTtftMs: number; totalTokPerSec: number }>(),
 };
 
 function recordUsage(resp: StreamingResult) {
@@ -51,13 +53,16 @@ function recordUsage(resp: StreamingResult) {
   }
   // Track per-model perf stats
   if (resp.model) {
-    const existing = session.modelStats.get(resp.model) || { calls: 0, totalTtftMs: 0, totalTokPerSec: 0 };
+    const existing = session.modelStats.get(resp.model) || { calls: 0, perfCalls: 0, totalTtftMs: 0, totalTokPerSec: 0 };
     existing.calls++;
     if (resp.ttftMs) existing.totalTtftMs += resp.ttftMs;
     const tokPerSec = resp.usage && resp.generationMs > 0
       ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
       : 0;
-    if (tokPerSec > 0) existing.totalTokPerSec += tokPerSec;
+    if (tokPerSec > 0) {
+      existing.perfCalls++;
+      existing.totalTokPerSec += tokPerSec;
+    }
     session.modelStats.set(resp.model, existing);
   }
 }
@@ -404,6 +409,7 @@ async function chatCompletionStreaming(
     temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
     stream: true,
+    stream_options: { include_usage: true },
   };
   if (options.model || LM_MODEL) {
     body.model = options.model || LM_MODEL;
@@ -502,7 +508,11 @@ async function chatCompletionStreaming(
 
   // Strip <think>...</think> reasoning blocks from models that always emit them
   // (e.g. GLM Flash, Nemotron). Claude doesn't need the model's internal reasoning.
-  const cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '').trim();
+  // Handle both closed blocks and unclosed ones (model ran out of tokens mid-think,
+  // or grammar-constrained output forced content before the closing tag).
+  let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');  // closed blocks
+  cleanContent = cleanContent.replace(/^<think>\s*/, '');                   // orphaned opening tag
+  cleanContent = cleanContent.trim();
 
   return { content: cleanContent, model, usage, finishReason, truncated, ttftMs, generationMs };
 }
@@ -546,36 +556,80 @@ function getMaxContextLength(model: ModelInfo): number | undefined {
   return model.max_context_length;
 }
 
-/**
- * Check if there are better-suited models available (downloaded but not loaded)
- * for a given task type. Returns a suggestion string or empty string.
- */
-async function getModelSuggestion(currentModelId: string, taskType?: string): Promise<string> {
+// ── Model routing ─────────────────────────────────────────────────────
+// Picks the best loaded model for a given task type.
+// If only one model is loaded, uses it but may suggest a better one.
+// If multiple are loaded, routes to the best match.
+
+type TaskType = 'code' | 'chat' | 'analysis' | 'embedding';
+
+interface RoutingDecision {
+  modelId: string;
+  hints: PromptHints;
+  suggestion?: string;  // info about routing decision
+}
+
+async function routeToModel(taskType: TaskType): Promise<RoutingDecision> {
+  let models: ModelInfo[];
   try {
-    const models = await listModelsRaw();
-    const available = models.filter((m) => m.state === 'not-loaded');
-    if (available.length === 0) return '';
-
-    // Only suggest if we know the current model's profile
-    const currentModel = models.find((m) => m.id === currentModelId);
-    if (!currentModel) return '';
-    const currentProfile = getModelProfile(currentModel);
-
-    // Look for available models that might be better for code tasks
-    if (taskType === 'code') {
-      const codeModels = available.filter((m) => {
-        const p = getModelProfile(m);
-        return p && (p.family.toLowerCase().includes('coder') || p.bestFor.some((b) => b.includes('code')));
-      });
-      if (codeModels.length > 0 && currentProfile && !currentProfile.bestFor.some((b) => b.includes('code'))) {
-        return `\n💡 Tip: ${codeModels[0].id} is available and specialised for code tasks — ask the user to load it in LM Studio.`;
-      }
-    }
-
-    return '';
+    models = await listModelsRaw();
   } catch {
-    return '';
+    // Can't reach server — fall back to default
+    const hints = getPromptHints(LM_MODEL);
+    return { modelId: LM_MODEL || '', hints };
   }
+
+  const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
+  const available = models.filter((m) => m.state === 'not-loaded');
+
+  if (loaded.length === 0) {
+    const hints = getPromptHints(LM_MODEL);
+    return { modelId: LM_MODEL || '', hints };
+  }
+
+  // Score each loaded model for the requested task type
+  let bestModel = loaded[0];
+  let bestScore = -1;
+
+  for (const model of loaded) {
+    const hints = getPromptHints(model.id, model.arch);
+    // Primary: is this task type in the model's best types?
+    let score = (hints.bestTaskTypes ?? []).includes(taskType) ? 10 : 0;
+    // Bonus: code-specialised models get extra points for code tasks
+    const profile = getModelProfile(model);
+    if (taskType === 'code' && profile?.family.toLowerCase().includes('coder')) score += 5;
+    // Bonus: larger context for analysis tasks
+    if (taskType === 'analysis') {
+      const ctx = getContextLength(model);
+      if (ctx && ctx > 100000) score += 2;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestModel = model;
+    }
+  }
+
+  const hints = getPromptHints(bestModel.id, bestModel.arch);
+  const result: RoutingDecision = { modelId: bestModel.id, hints };
+
+  // If the best loaded model isn't ideal for this task, suggest a better available one.
+  // We don't JIT-load because model loading takes minutes and the MCP SDK has a ~60s
+  // hard timeout. Instead, suggest the user loads the better model in LM Studio.
+  if (!(hints.bestTaskTypes ?? []).includes(taskType)) {
+    const better = available.find((m) => {
+      const mHints = getPromptHints(m.id, m.arch);
+      return (mHints.bestTaskTypes ?? []).includes(taskType);
+    });
+    if (better) {
+      const label = taskType === 'code' ? 'code tasks'
+        : taskType === 'analysis' ? 'analysis'
+        : taskType === 'embedding' ? 'embeddings'
+        : 'this kind of task';
+      result.suggestion = `💡 ${better.id} is downloaded and better suited for ${label} — ask the user to load it in LM Studio.`;
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -636,7 +690,9 @@ const TOOLS = [
       '(5) For code generation, include the surrounding context (imports, types, function signatures).\n\n' +
       'QA: Always review the local LLM\'s output before using it. Verify correctness, check edge cases, ' +
       'and fix any issues. You are the architect — the local model is a fast drafter, not the final authority.\n\n' +
-      'The local model, context window, and speed vary — call the discover tool to check what is loaded.',
+      'ROUTING: If multiple models are loaded, houtini-lm automatically picks the best one for the task. ' +
+      'If a better model is downloaded but not loaded, you\'ll see a suggestion in the response footer. ' +
+      'Call discover to see what\'s available.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -798,7 +854,7 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.6.0' },
+  { name: 'houtini-lm', version: '2.7.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -817,8 +873,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_tokens?: number;
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
         };
+
+        const route = await routeToModel('chat');
         const messages: ChatMessage[] = [];
-        if (system) messages.push({ role: 'system', content: system });
+        // Inject output constraint into system prompt if the model needs it
+        const systemContent = system
+          ? (route.hints.outputConstraint ? `${system}\n\n${route.hints.outputConstraint}` : system)
+          : (route.hints.outputConstraint || undefined);
+        if (systemContent) messages.push({ role: 'system', content: systemContent });
         messages.push({ role: 'user', content: message });
 
         const responseFormat: ResponseFormat | undefined = json_schema
@@ -826,8 +888,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : undefined;
 
         const resp = await chatCompletionStreaming(messages, {
-          temperature,
+          temperature: temperature ?? route.hints.chatTemp,
           maxTokens: max_tokens,
+          model: route.modelId,
           responseFormat,
         });
 
@@ -845,8 +908,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
         };
 
+        const route = await routeToModel('analysis');
         const messages: ChatMessage[] = [];
-        if (system) messages.push({ role: 'system', content: system });
+        const systemContent = system
+          ? (route.hints.outputConstraint ? `${system}\n\n${route.hints.outputConstraint}` : system)
+          : (route.hints.outputConstraint || undefined);
+        if (systemContent) messages.push({ role: 'system', content: systemContent });
 
         let userContent = instruction;
         if (context) userContent = `Context:\n${context}\n\nInstruction:\n${instruction}`;
@@ -857,8 +924,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : undefined;
 
         const resp = await chatCompletionStreaming(messages, {
-          temperature,
+          temperature: temperature ?? route.hints.chatTemp,
           maxTokens: max_tokens,
+          model: route.modelId,
           responseFormat,
         });
 
@@ -877,10 +945,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const lang = language || 'unknown';
+        const route = await routeToModel('code');
+        const outputConstraint = route.hints.outputConstraint
+          ? ` ${route.hints.outputConstraint}`
+          : '';
+
         const codeMessages: ChatMessage[] = [
           {
             role: 'system',
-            content: `Expert ${lang} developer. Analyse the provided code and complete the task. Be specific — reference line numbers, function names, and concrete fixes. No preamble.`,
+            content: `Expert ${lang} developer. Analyse the provided code and complete the task. Be specific — reference line numbers, function names, and concrete fixes.${outputConstraint}`,
           },
           {
             role: 'user',
@@ -889,13 +962,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ];
 
         const codeResp = await chatCompletionStreaming(codeMessages, {
-          temperature: 0.2,
+          temperature: route.hints.codeTemp,
           maxTokens: codeMaxTokens ?? DEFAULT_MAX_TOKENS,
+          model: route.modelId,
         });
 
         const codeFooter = formatFooter(codeResp, lang);
-        const suggestion = await getModelSuggestion(codeResp.model, 'code');
-        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestion }] };
+        const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
+        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
       }
 
       case 'discover': {
@@ -969,7 +1043,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           text += `\n\nPerformance (this session):\n`;
           for (const [modelId, stats] of session.modelStats) {
             const avgTtft = stats.calls > 0 ? Math.round(stats.totalTtftMs / stats.calls) : 0;
-            const avgTokSec = stats.calls > 0 ? (stats.totalTokPerSec / stats.calls).toFixed(1) : '?';
+            const avgTokSec = stats.perfCalls > 0 ? (stats.totalTokPerSec / stats.perfCalls).toFixed(1) : '?';
             text += `  ${modelId}: ${stats.calls} calls, avg TTFT ${avgTtft}ms, avg ${avgTokSec} tok/s\n`;
           }
         }

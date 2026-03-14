@@ -10,7 +10,7 @@
 
 import initSqlJs, { type Database } from 'sql.js';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -41,6 +41,123 @@ export interface ModelProfile {
   strengths: string[];
   weaknesses: string[];
   bestFor: string[];
+}
+
+// ── Prompt hints ─────────────────────────────────────────────────────
+// Per-family guidance on how to get the best output from each model.
+// Used by the routing layer to shape system prompts and parameters.
+
+export interface PromptHints {
+  /** Preferred temperature range for this model family */
+  codeTemp: number;
+  chatTemp: number;
+  /** Extra system prompt suffix to constrain output format */
+  outputConstraint: string;
+  /** Whether this model emits <think> blocks that need stripping */
+  emitsThinkBlocks: boolean;
+  /** Task types this model excels at (for routing) */
+  bestTaskTypes: ('code' | 'chat' | 'analysis' | 'embedding')[];
+}
+
+const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
+  {
+    pattern: /glm[- ]?4/i,
+    hints: {
+      codeTemp: 0.1,
+      chatTemp: 0.3,
+      outputConstraint: 'Respond with ONLY the requested output. No step-by-step reasoning. No numbered analysis. No preamble. Go straight to the answer.',
+      emitsThinkBlocks: true,
+      bestTaskTypes: ['chat', 'analysis'],
+    },
+  },
+  {
+    pattern: /qwen3.*coder|qwen.*coder/i,
+    hints: {
+      codeTemp: 0.1,
+      chatTemp: 0.3,
+      outputConstraint: 'Be direct. Output only what was asked for.',
+      emitsThinkBlocks: true,
+      bestTaskTypes: ['code'],
+    },
+  },
+  {
+    pattern: /qwen3(?!.*coder)(?!.*vl)/i,
+    hints: {
+      codeTemp: 0.2,
+      chatTemp: 0.3,
+      outputConstraint: 'Be direct. Output only what was asked for.',
+      emitsThinkBlocks: true,
+      bestTaskTypes: ['chat', 'analysis', 'code'],
+    },
+  },
+  {
+    pattern: /llama[- ]?3/i,
+    hints: {
+      codeTemp: 0.2,
+      chatTemp: 0.4,
+      outputConstraint: '',
+      emitsThinkBlocks: false,
+      bestTaskTypes: ['chat', 'code', 'analysis'],
+    },
+  },
+  {
+    pattern: /nemotron/i,
+    hints: {
+      codeTemp: 0.1,
+      chatTemp: 0.3,
+      outputConstraint: '',
+      emitsThinkBlocks: true,
+      bestTaskTypes: ['analysis', 'code'],
+    },
+  },
+  {
+    pattern: /granite/i,
+    hints: {
+      codeTemp: 0.2,
+      chatTemp: 0.3,
+      outputConstraint: '',
+      emitsThinkBlocks: false,
+      bestTaskTypes: ['code', 'chat'],
+    },
+  },
+  {
+    pattern: /gpt[- ]?oss/i,
+    hints: {
+      codeTemp: 0.2,
+      chatTemp: 0.4,
+      outputConstraint: '',
+      emitsThinkBlocks: false,
+      bestTaskTypes: ['chat', 'code', 'analysis'],
+    },
+  },
+  {
+    pattern: /nomic.*embed|embed.*nomic/i,
+    hints: {
+      codeTemp: 0,
+      chatTemp: 0,
+      outputConstraint: '',
+      emitsThinkBlocks: false,
+      bestTaskTypes: ['embedding'],
+    },
+  },
+];
+
+/**
+ * Get prompt hints for a model by ID or architecture.
+ */
+export function getPromptHints(modelId: string, arch?: string): PromptHints {
+  for (const { pattern, hints } of PROMPT_HINTS) {
+    if (pattern.test(modelId)) return hints;
+    if (arch && pattern.test(arch)) return hints;
+  }
+  // Sensible defaults for unknown models
+  return {
+    codeTemp: 0.2,
+    chatTemp: 0.3,
+    outputConstraint: '',
+    emitsThinkBlocks: false,
+    bestTaskTypes: ['chat', 'code', 'analysis'],
+  };
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -139,7 +256,11 @@ export async function getCachedProfile(modelId: string): Promise<CachedModelProf
   return null;
 }
 
-export async function upsertProfile(profile: CachedModelProfile): Promise<void> {
+/**
+ * Insert or update a profile in the DB. Saves to disk immediately by default.
+ * Pass skipSave=true during batch operations, then call flushDb() when done.
+ */
+export async function upsertProfile(profile: CachedModelProfile, skipSave = false): Promise<void> {
   const database = await initDb();
   database.run(
     `INSERT OR REPLACE INTO model_profiles
@@ -164,6 +285,11 @@ export async function upsertProfile(profile: CachedModelProfile): Promise<void> 
       profile.source,
     ],
   );
+  if (!skipSave) saveDb();
+}
+
+/** Flush DB to disk. Call after batch upsertProfile(…, true) operations. */
+export function flushDb(): void {
   saveDb();
 }
 
@@ -397,7 +523,7 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
           bestFor: inferred.bestFor || null,
           fetchedAt: Date.now(),
           source: 'huggingface',
-        });
+        }, true);
         profiledCount++;
       } else {
         // No HF match — cache a minimal profile so we don't retry
@@ -417,13 +543,16 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
           bestFor: null,
           fetchedAt: Date.now(),
           source: 'inferred',
-        });
+        }, true);
         profiledCount++;
       }
     } catch (err) {
       process.stderr.write(`[houtini-lm] Failed to profile ${model.id}: ${err}\n`);
     }
   }
+
+  // Flush all changes to disk in one write
+  if (profiledCount > 0) flushDb();
 
   process.stderr.write(
     `[houtini-lm] Model cache: ${cachedCount} cached, ${profiledCount} profiled, ${models.length} total\n`,

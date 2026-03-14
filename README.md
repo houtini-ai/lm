@@ -1,4 +1,4 @@
-# @houtini/lm Houtini LM - Offload Tasks to Your Local LLM Server
+# @houtini/lm Houtini LM - Offload Tasks from Claude Code to Your Local LLM Server (LM Studio / Ollama) or a Cloud API
 
 [![npm version](https://img.shields.io/npm/v/@houtini/lm.svg?style=flat-square)](https://www.npmjs.com/package/@houtini/lm)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
@@ -160,6 +160,14 @@ Performance (this session):
 
 In practice, Claude delegates more aggressively the longer a session runs. After about 5,000 offloaded tokens, it starts hunting for more work to push over. Reinforcing loop.
 
+## Model routing
+
+If you've got multiple models loaded (or downloaded), houtini-lm picks the best one for each task automatically. Each model family has per-family prompt hints - temperature, output constraints, and think-block flags - so GLM gets told "no preamble, no step-by-step reasoning" while Qwen Coder gets a low temperature for focused code output.
+
+The routing scores loaded models against the task type (code, chat, analysis, embedding). If the best loaded model isn't ideal for the task, you'll see a suggestion in the response footer pointing to a better downloaded model. No runtime model swapping - model loading takes minutes, so houtini-lm suggests rather than blocks.
+
+Supported model families with curated prompt hints: GLM-4, Qwen3 Coder, Qwen3, LLaMA 3, Nemotron, Granite, GPT-OSS, Nomic Embed. Unknown models get sensible defaults.
+
 ## Tools
 
 ### `chat`
@@ -189,7 +197,7 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 
 ### `code_task`
 
-Built for code analysis. Pre-configured system prompt, locked to temperature 0.2 for focused output.
+Built for code analysis. Pre-configured system prompt with temperature and output constraints tuned per model family via the routing layer.
 
 | Parameter | Required | Default | What it does |
 |-----------|----------|---------|-------------|
