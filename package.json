@@ -1,6 +1,6 @@
 {
   "name": "@houtini/lm",
-  "version": "2.4.1",
+  "version": "2.6.0",
   "type": "module",
   "description": "MCP server for local LLMs — connects to LM Studio or any OpenAI-compatible endpoint",
   "mcpName": "io.github.houtini-ai/lm",
@@ -44,10 +44,12 @@
     "url": "https://github.com/sponsors/houtini-ai"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0"
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "sql.js": "^1.14.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/sql.js": "^1.4.9",
     "typescript": "^5.7.0"
   },
   "engines": {

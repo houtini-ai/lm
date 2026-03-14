@@ -12,6 +12,12 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import {
+  profileModelsAtStartup,
+  getCachedProfile,
+  toModelProfile as cachedToProfile,
+  getHFEnrichmentLine,
+} from './model-cache.js';
 
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
@@ -33,13 +39,26 @@ const session = {
   calls: 0,
   promptTokens: 0,
   completionTokens: 0,
+  /** Per-model performance tracking for routing insights */
+  modelStats: new Map<string, { calls: number; totalTtftMs: number; totalTokPerSec: number }>(),
 };
 
-function recordUsage(usage?: { prompt_tokens: number; completion_tokens: number }) {
+function recordUsage(resp: StreamingResult) {
   session.calls++;
-  if (usage) {
-    session.promptTokens += usage.prompt_tokens;
-    session.completionTokens += usage.completion_tokens;
+  if (resp.usage) {
+    session.promptTokens += resp.usage.prompt_tokens;
+    session.completionTokens += resp.usage.completion_tokens;
+  }
+  // Track per-model perf stats
+  if (resp.model) {
+    const existing = session.modelStats.get(resp.model) || { calls: 0, totalTtftMs: 0, totalTokPerSec: 0 };
+    existing.calls++;
+    if (resp.ttftMs) existing.totalTtftMs += resp.ttftMs;
+    const tokPerSec = resp.usage && resp.generationMs > 0
+      ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
+      : 0;
+    if (tokPerSec > 0) existing.totalTokPerSec += tokPerSec;
+    session.modelStats.set(resp.model, existing);
   }
 }
 
@@ -68,14 +87,268 @@ interface StreamingResult {
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   finishReason: string;
   truncated: boolean;
+  /** Time to first token in milliseconds */
+  ttftMs?: number;
+  /** Total generation time in milliseconds */
+  generationMs: number;
+}
+
+/** OpenAI-compatible response_format for structured output */
+interface ResponseFormat {
+  type: 'json_schema' | 'json_object' | 'text';
+  json_schema?: {
+    name: string;
+    strict?: boolean | string;
+    schema: Record<string, unknown>;
+  };
 }
 
 interface ModelInfo {
   id: string;
-  context_length?: number;
-  max_model_len?: number;
+  object?: string;
+  type?: string;              // "llm" | "vlm" | "embeddings"
+  publisher?: string;          // e.g. "nvidia", "qwen", "ibm"
+  arch?: string;               // e.g. "nemotron_h_moe", "qwen3moe", "llama"
+  compatibility_type?: string; // "gguf" | "mlx"
+  quantization?: string;       // e.g. "Q4_K_M", "BF16", "MXFP4"
+  state?: string;              // "loaded" | "not-loaded"
+  max_context_length?: number; // model's maximum context (v0 API)
+  loaded_context_length?: number; // actual context configured when loaded
+  capabilities?: string[];     // e.g. ["tool_use"]
+  context_length?: number;     // v1 API fallback
+  max_model_len?: number;      // vLLM fallback
   owned_by?: string;
   [key: string]: unknown;
+}
+
+// ── Model knowledge base ─────────────────────────────────────────────
+// Maps known model families (matched by ID or architecture) to human-readable
+// descriptions and capability profiles. This lets houtini-lm tell Claude what
+// each model is good at, so it can make informed delegation decisions.
+
+interface ModelProfile {
+  family: string;
+  description: string;
+  strengths: string[];
+  weaknesses: string[];
+  bestFor: string[];
+  size?: string; // e.g. "3B", "70B" — only if consistently one size
+}
+
+const MODEL_PROFILES: { pattern: RegExp; profile: ModelProfile }[] = [
+  {
+    pattern: /nemotron|nemotron_h_moe/i,
+    profile: {
+      family: 'NVIDIA Nemotron',
+      description: 'NVIDIA\'s compact reasoning model optimised for accurate, structured responses. Strong at step-by-step logic and instruction following.',
+      strengths: ['logical reasoning', 'math', 'step-by-step problem solving', 'code review', 'structured output'],
+      weaknesses: ['creative writing', 'constrained generation', 'factual knowledge on niche topics'],
+      bestFor: ['analysis tasks', 'code bug-finding', 'math/science questions', 'data transformation'],
+    },
+  },
+  {
+    pattern: /granite|granitehybrid/i,
+    profile: {
+      family: 'IBM Granite',
+      description: 'IBM\'s enterprise-focused model family. Compact and efficient, designed for business and code tasks with strong instruction following.',
+      strengths: ['code generation', 'instruction following', 'enterprise tasks', 'efficiency'],
+      weaknesses: ['creative tasks', 'long-form generation'],
+      bestFor: ['boilerplate generation', 'code explanation', 'structured Q&A'],
+    },
+  },
+  {
+    pattern: /qwen3-coder|qwen3.*coder/i,
+    profile: {
+      family: 'Qwen3 Coder',
+      description: 'Alibaba\'s code-specialised model with agentic capabilities. Excellent at code generation, review, and multi-step coding tasks.',
+      strengths: ['code generation', 'code review', 'debugging', 'test writing', 'refactoring', 'multi-step reasoning'],
+      weaknesses: ['non-code creative tasks'],
+      bestFor: ['code generation', 'code review', 'test stubs', 'type definitions', 'refactoring'],
+    },
+  },
+  {
+    pattern: /qwen3-vl|qwen.*vl/i,
+    profile: {
+      family: 'Qwen3 Vision-Language',
+      description: 'Alibaba\'s multimodal model handling both text and image inputs. Can analyse screenshots, diagrams, and visual content.',
+      strengths: ['image understanding', 'visual Q&A', 'diagram analysis', 'OCR'],
+      weaknesses: ['pure text tasks (use a text-only model instead)'],
+      bestFor: ['screenshot analysis', 'UI review', 'diagram interpretation'],
+    },
+  },
+  {
+    pattern: /qwen3(?!.*coder)(?!.*vl)/i,
+    profile: {
+      family: 'Qwen3',
+      description: 'Alibaba\'s general-purpose model with strong multilingual and reasoning capabilities. Good all-rounder.',
+      strengths: ['general reasoning', 'multilingual', 'code', 'instruction following'],
+      weaknesses: ['specialised code tasks (use Qwen3 Coder instead)'],
+      bestFor: ['general Q&A', 'translation', 'summarisation', 'brainstorming'],
+    },
+  },
+  {
+    pattern: /llama[- ]?3/i,
+    profile: {
+      family: 'Meta LLaMA 3',
+      description: 'Meta\'s open-weight general-purpose model. Strong baseline across tasks with large community fine-tune ecosystem.',
+      strengths: ['general reasoning', 'code', 'instruction following', 'broad knowledge'],
+      weaknesses: ['specialised tasks where fine-tuned models excel'],
+      bestFor: ['general delegation', 'drafting', 'code review', 'Q&A'],
+    },
+  },
+  {
+    pattern: /minimax[- ]?m2/i,
+    profile: {
+      family: 'MiniMax M2',
+      description: 'MiniMax\'s large MoE model with strong long-context and reasoning capabilities.',
+      strengths: ['long context', 'reasoning', 'creative writing', 'multilingual'],
+      weaknesses: ['may be slower due to model size'],
+      bestFor: ['long document analysis', 'creative tasks', 'complex reasoning'],
+    },
+  },
+  {
+    pattern: /kimi[- ]?k2/i,
+    profile: {
+      family: 'Kimi K2',
+      description: 'Moonshot AI\'s large MoE model with strong agentic and tool-use capabilities.',
+      strengths: ['agentic tasks', 'tool use', 'code', 'reasoning', 'long context'],
+      weaknesses: ['may be slower due to model size'],
+      bestFor: ['complex multi-step tasks', 'code generation', 'reasoning chains'],
+    },
+  },
+  {
+    pattern: /gpt-oss/i,
+    profile: {
+      family: 'OpenAI GPT-OSS',
+      description: 'OpenAI\'s open-source model release. General-purpose with strong instruction following.',
+      strengths: ['instruction following', 'general reasoning', 'code'],
+      weaknesses: ['less tested in open ecosystem than LLaMA/Qwen'],
+      bestFor: ['general delegation', 'code tasks', 'Q&A'],
+    },
+  },
+  {
+    pattern: /glm[- ]?4/i,
+    profile: {
+      family: 'GLM-4',
+      description: 'Zhipu AI\'s open-weight MoE model. Fast inference with strong general reasoning, multilingual support, and tool-use capabilities. Uses chain-of-thought reasoning internally. MIT licensed.',
+      strengths: ['fast inference', 'general reasoning', 'tool use', 'multilingual', 'code', 'instruction following', 'chain-of-thought'],
+      weaknesses: ['always emits internal reasoning (stripped automatically)', 'less tested in English-only benchmarks than LLaMA/Qwen'],
+      bestFor: ['general delegation', 'fast drafting', 'code tasks', 'structured output', 'Q&A'],
+    },
+  },
+  {
+    pattern: /nomic.*embed|embed.*nomic/i,
+    profile: {
+      family: 'Nomic Embed',
+      description: 'Text embedding model for semantic search and similarity. Not a chat model — produces vector embeddings.',
+      strengths: ['text embeddings', 'semantic search', 'clustering'],
+      weaknesses: ['cannot chat or generate text'],
+      bestFor: ['RAG pipelines', 'semantic similarity', 'document search'],
+    },
+  },
+  {
+    pattern: /abliterated/i,
+    profile: {
+      family: 'Abliterated (uncensored)',
+      description: 'Community fine-tune with safety guardrails removed. More permissive but may produce lower-quality or unreliable output.',
+      strengths: ['fewer refusals', 'unconstrained generation'],
+      weaknesses: ['may hallucinate more', 'no safety filtering', 'less tested'],
+      bestFor: ['tasks where the base model refuses unnecessarily'],
+    },
+  },
+];
+
+/**
+ * Match a model to its known profile.
+ * Priority: 1) static MODEL_PROFILES (curated), 2) SQLite cache (auto-generated from HF)
+ */
+function getModelProfile(model: ModelInfo): ModelProfile | undefined {
+  // Try static profiles first (curated, most reliable)
+  for (const { pattern, profile } of MODEL_PROFILES) {
+    if (pattern.test(model.id)) return profile;
+  }
+  if (model.arch) {
+    for (const { pattern, profile } of MODEL_PROFILES) {
+      if (pattern.test(model.arch)) return profile;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Async version that also checks SQLite cache for auto-generated profiles.
+ * Use this when you need the most complete profile available.
+ */
+async function getModelProfileAsync(model: ModelInfo): Promise<ModelProfile | undefined> {
+  // Static profiles take priority
+  const staticProfile = getModelProfile(model);
+  if (staticProfile) return staticProfile;
+
+  // Check SQLite cache for auto-generated profile
+  try {
+    const cached = await getCachedProfile(model.id);
+    if (cached) {
+      const profile = cachedToProfile(cached);
+      if (profile) return profile;
+    }
+  } catch {
+    // Cache lookup failed — fall through
+  }
+
+  return undefined;
+}
+
+/**
+ * Format a single model's full metadata for display.
+ * Async because it may fetch HuggingFace enrichment data.
+ */
+async function formatModelDetail(model: ModelInfo, enrichWithHF: boolean = false): Promise<string> {
+  const ctx = getContextLength(model);
+  const maxCtx = getMaxContextLength(model);
+  // Use async profile lookup (checks static + SQLite cache)
+  const profile = await getModelProfileAsync(model);
+  const parts: string[] = [];
+
+  // Header line
+  parts.push(`  ${model.state === 'loaded' ? '●' : '○'} ${model.id}`);
+
+  // Metadata line
+  const meta: string[] = [];
+  if (model.type) meta.push(`type: ${model.type}`);
+  if (model.arch) meta.push(`arch: ${model.arch}`);
+  if (model.quantization) meta.push(`quant: ${model.quantization}`);
+  if (model.compatibility_type) meta.push(`format: ${model.compatibility_type}`);
+  // Show loaded context vs max context when both are available and different
+  if (model.loaded_context_length && maxCtx && model.loaded_context_length !== maxCtx) {
+    meta.push(`context: ${model.loaded_context_length.toLocaleString()} (max ${maxCtx.toLocaleString()})`);
+  } else if (ctx) {
+    meta.push(`context: ${ctx.toLocaleString()}`);
+  }
+  if (model.publisher) meta.push(`by: ${model.publisher}`);
+  if (meta.length > 0) parts.push(`    ${meta.join(' · ')}`);
+
+  // Capabilities
+  if (model.capabilities && model.capabilities.length > 0) {
+    parts.push(`    Capabilities: ${model.capabilities.join(', ')}`);
+  }
+
+  // Profile info (static or auto-generated from SQLite cache)
+  if (profile) {
+    parts.push(`    ${profile.family}: ${profile.description}`);
+    parts.push(`    Best for: ${profile.bestFor.join(', ')}`);
+  }
+
+  // HuggingFace enrichment line from SQLite cache
+  if (enrichWithHF) {
+    try {
+      const hfLine = await getHFEnrichmentLine(model.id);
+      if (hfLine) parts.push(hfLine);
+    } catch {
+      // HF enrichment is best-effort — never block on failure
+    }
+  }
+
+  return parts.join('\n');
 }
 
 /**
@@ -124,7 +397,7 @@ async function timedRead(
  */
 async function chatCompletionStreaming(
   messages: ChatMessage[],
-  options: { temperature?: number; maxTokens?: number; model?: string } = {},
+  options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat } = {},
 ): Promise<StreamingResult> {
   const body: Record<string, unknown> = {
     messages,
@@ -134,6 +407,9 @@ async function chatCompletionStreaming(
   };
   if (options.model || LM_MODEL) {
     body.model = options.model || LM_MODEL;
+  }
+  if (options.responseFormat) {
+    body.response_format = options.responseFormat;
   }
 
   const startTime = Date.now();
@@ -161,6 +437,7 @@ async function chatCompletionStreaming(
   let finishReason = '';
   let truncated = false;
   let buffer = '';
+  let ttftMs: number | undefined;
 
   try {
     while (true) {
@@ -201,7 +478,10 @@ async function chatCompletionStreaming(
           if (json.model) model = json.model;
 
           const delta = json.choices?.[0]?.delta;
-          if (delta?.content) content += delta.content;
+          if (delta?.content) {
+            if (ttftMs === undefined) ttftMs = Date.now() - startTime;
+            content += delta.content;
+          }
 
           const reason = json.choices?.[0]?.finish_reason;
           if (reason) finishReason = reason;
@@ -218,10 +498,35 @@ async function chatCompletionStreaming(
     reader.releaseLock();
   }
 
-  return { content, model, usage, finishReason, truncated };
+  const generationMs = Date.now() - startTime;
+
+  // Strip <think>...</think> reasoning blocks from models that always emit them
+  // (e.g. GLM Flash, Nemotron). Claude doesn't need the model's internal reasoning.
+  const cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '').trim();
+
+  return { content: cleanContent, model, usage, finishReason, truncated, ttftMs, generationMs };
 }
 
+/**
+ * Fetch models from LM Studio's native v0 API first (richer metadata),
+ * falling back to the OpenAI-compatible v1 endpoint for non-LM-Studio hosts.
+ */
 async function listModelsRaw(): Promise<ModelInfo[]> {
+  // Try v0 API first — returns type, arch, publisher, quantization, state
+  try {
+    const v0 = await fetchWithTimeout(
+      `${LM_BASE_URL}/api/v0/models`,
+      { headers: apiHeaders() },
+    );
+    if (v0.ok) {
+      const data = (await v0.json()) as { data: ModelInfo[] };
+      return data.data;
+    }
+  } catch {
+    // v0 not available — fall through to v1
+  }
+
+  // Fallback: OpenAI-compatible v1 endpoint (works with Ollama, vLLM, llama.cpp)
   const res = await fetchWithTimeout(
     `${LM_BASE_URL}/v1/models`,
     { headers: apiHeaders() },
@@ -232,8 +537,45 @@ async function listModelsRaw(): Promise<ModelInfo[]> {
 }
 
 function getContextLength(model: ModelInfo): number {
-  // LM Studio uses context_length, vLLM uses max_model_len, fall back to env/100k
-  return model.context_length ?? model.max_model_len ?? FALLBACK_CONTEXT_LENGTH;
+  // Prefer loaded_context_length (actual configured context) over max_context_length (theoretical max)
+  // v0 API: loaded_context_length / max_context_length, v1: context_length, vLLM: max_model_len
+  return model.loaded_context_length ?? model.max_context_length ?? model.context_length ?? model.max_model_len ?? FALLBACK_CONTEXT_LENGTH;
+}
+
+function getMaxContextLength(model: ModelInfo): number | undefined {
+  return model.max_context_length;
+}
+
+/**
+ * Check if there are better-suited models available (downloaded but not loaded)
+ * for a given task type. Returns a suggestion string or empty string.
+ */
+async function getModelSuggestion(currentModelId: string, taskType?: string): Promise<string> {
+  try {
+    const models = await listModelsRaw();
+    const available = models.filter((m) => m.state === 'not-loaded');
+    if (available.length === 0) return '';
+
+    // Only suggest if we know the current model's profile
+    const currentModel = models.find((m) => m.id === currentModelId);
+    if (!currentModel) return '';
+    const currentProfile = getModelProfile(currentModel);
+
+    // Look for available models that might be better for code tasks
+    if (taskType === 'code') {
+      const codeModels = available.filter((m) => {
+        const p = getModelProfile(m);
+        return p && (p.family.toLowerCase().includes('coder') || p.bestFor.some((b) => b.includes('code')));
+      });
+      if (codeModels.length > 0 && currentProfile && !currentProfile.bestFor.some((b) => b.includes('code'))) {
+        return `\n💡 Tip: ${codeModels[0].id} is available and specialised for code tasks — ask the user to load it in LM Studio.`;
+      }
+    }
+
+    return '';
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -241,11 +583,22 @@ function getContextLength(model: ModelInfo): number {
  */
 function formatFooter(resp: StreamingResult, extra?: string): string {
   // Record usage for session tracking before formatting
-  recordUsage(resp.usage);
+  recordUsage(resp);
 
   const parts: string[] = [];
   if (resp.model) parts.push(`Model: ${resp.model}`);
-  if (resp.usage) parts.push(`This call: ${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
+  if (resp.usage) parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
+
+  // Perf stats — computed from streaming, no proprietary API needed
+  const perfParts: string[] = [];
+  if (resp.ttftMs !== undefined) perfParts.push(`TTFT: ${resp.ttftMs}ms`);
+  if (resp.usage && resp.generationMs > 0) {
+    const tokPerSec = resp.usage.completion_tokens / (resp.generationMs / 1000);
+    perfParts.push(`${tokPerSec.toFixed(1)} tok/s`);
+  }
+  if (resp.generationMs) perfParts.push(`${(resp.generationMs / 1000).toFixed(1)}s`);
+  if (perfParts.length > 0) parts.push(perfParts.join(', '));
+
   if (extra) parts.push(extra);
   if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
 
@@ -303,6 +656,10 @@ const TOOLS = [
           type: 'number',
           description: 'Max response tokens. Default 2048. Use higher for code generation, lower for quick answers.',
         },
+        json_schema: {
+          type: 'object',
+          description: 'Force structured JSON output. Provide a JSON Schema object and the response will be guaranteed valid JSON conforming to it. Example: {"name":"result","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}}',
+        },
       },
       required: ['message'],
     },
@@ -347,6 +704,10 @@ const TOOLS = [
         max_tokens: {
           type: 'number',
           description: 'Max response tokens. Default 2048.',
+        },
+        json_schema: {
+          type: 'object',
+          description: 'Force structured JSON output. Provide a JSON Schema object and the response will be guaranteed valid JSON conforming to it.',
         },
       },
       required: ['instruction'],
@@ -405,16 +766,39 @@ const TOOLS = [
   {
     name: 'list_models',
     description:
-      'List all models currently loaded in the local LLM server, with context window sizes. ' +
-      'Use discover instead for a quick availability check.',
+      'List all models on the local LLM server — both loaded (ready) and available (downloaded but not active). ' +
+      'Shows rich metadata for each model: type (llm/vlm/embeddings), architecture, quantization, context window, ' +
+      'and a capability profile describing what the model is best at. ' +
+      'Use this to understand which models are available and suggest switching when a different model would suit the task better.',
     inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'embed',
+    description:
+      'Generate text embeddings via the local LLM server. Requires an embedding model to be loaded ' +
+      '(e.g. Nomic Embed). Returns a vector representation of the input text for semantic search, ' +
+      'similarity comparison, or RAG pipelines. Uses the OpenAI-compatible /v1/embeddings endpoint.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        input: {
+          type: 'string',
+          description: 'The text to embed. Can be a single string.',
+        },
+        model: {
+          type: 'string',
+          description: 'Embedding model ID. If omitted, uses whatever embedding model is loaded.',
+        },
+      },
+      required: ['input'],
+    },
   },
 ];
 
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.4.1' },
+  { name: 'houtini-lm', version: '2.6.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -426,19 +810,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'chat': {
-        const { message, system, temperature, max_tokens } = args as {
+        const { message, system, temperature, max_tokens, json_schema } = args as {
           message: string;
           system?: string;
           temperature?: number;
           max_tokens?: number;
+          json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
         };
         const messages: ChatMessage[] = [];
         if (system) messages.push({ role: 'system', content: system });
         messages.push({ role: 'user', content: message });
 
+        const responseFormat: ResponseFormat | undefined = json_schema
+          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
+          : undefined;
+
         const resp = await chatCompletionStreaming(messages, {
           temperature,
           maxTokens: max_tokens,
+          responseFormat,
         });
 
         const footer = formatFooter(resp);
@@ -446,12 +836,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'custom_prompt': {
-        const { system, context, instruction, temperature, max_tokens } = args as {
+        const { system, context, instruction, temperature, max_tokens, json_schema } = args as {
           system?: string;
           context?: string;
           instruction: string;
           temperature?: number;
           max_tokens?: number;
+          json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
         };
 
         const messages: ChatMessage[] = [];
@@ -461,9 +852,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (context) userContent = `Context:\n${context}\n\nInstruction:\n${instruction}`;
         messages.push({ role: 'user', content: userContent });
 
+        const responseFormat: ResponseFormat | undefined = json_schema
+          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
+          : undefined;
+
         const resp = await chatCompletionStreaming(messages, {
           temperature,
           maxTokens: max_tokens,
+          responseFormat,
         });
 
         const footer = formatFooter(resp);
@@ -498,7 +894,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
 
         const codeFooter = formatFooter(codeResp, lang);
-        return { content: [{ type: 'text', text: codeResp.content + codeFooter }] };
+        const suggestion = await getModelSuggestion(codeResp.model, 'code');
+        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestion }] };
       }
 
       case 'discover': {
@@ -529,45 +926,128 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const lines = models.map((m) => {
-          const ctx = getContextLength(m);
-          return `  • ${m.id} (context: ${ctx.toLocaleString()} tokens)`;
-        });
+        const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
+        const available = models.filter((m) => m.state === 'not-loaded');
 
-        const primary = models[0];
+        const primary = loaded[0] || models[0];
         const ctx = getContextLength(primary);
+        const primaryProfile = await getModelProfileAsync(primary);
 
         const sessionStats = session.calls > 0
           ? `\nSession stats: ${(session.promptTokens + session.completionTokens).toLocaleString()} tokens offloaded across ${session.calls} call${session.calls === 1 ? '' : 's'}`
           : '\nSession stats: no calls yet — delegate tasks to start saving tokens';
 
-        return {
-          content: [{
-            type: 'text',
-            text:
-              `Status: ONLINE\n` +
-              `Endpoint: ${LM_BASE_URL}\n` +
-              `Latency: ${ms}ms\n` +
-              `Model: ${primary.id}\n` +
-              `Context window: ${ctx.toLocaleString()} tokens\n` +
-              `\nLoaded models:\n${lines.join('\n')}` +
-              `${sessionStats}\n\n` +
-              `The local LLM is available. You can delegate tasks using chat, custom_prompt, or code_task.`,
-          }],
-        };
+        let text =
+          `Status: ONLINE\n` +
+          `Endpoint: ${LM_BASE_URL}\n` +
+          `Latency: ${ms}ms\n` +
+          `Active model: ${primary.id}\n` +
+          `Context window: ${ctx.toLocaleString()} tokens\n`;
+
+        if (primaryProfile) {
+          text += `Family: ${primaryProfile.family}\n`;
+          text += `Description: ${primaryProfile.description}\n`;
+          text += `Best for: ${primaryProfile.bestFor.join(', ')}\n`;
+          text += `Strengths: ${primaryProfile.strengths.join(', ')}\n`;
+          if (primaryProfile.weaknesses.length > 0) {
+            text += `Weaknesses: ${primaryProfile.weaknesses.join(', ')}\n`;
+          }
+        }
+
+        if (loaded.length > 0) {
+          text += `\nLoaded models (● ready to use):\n`;
+          text += (await Promise.all(loaded.map((m) => formatModelDetail(m)))).join('\n\n');
+        }
+
+        if (available.length > 0) {
+          text += `\n\nAvailable models (○ downloaded, not loaded — can be activated in LM Studio):\n`;
+          text += (await Promise.all(available.map((m) => formatModelDetail(m)))).join('\n\n');
+        }
+
+        // Per-model performance stats from this session
+        if (session.modelStats.size > 0) {
+          text += `\n\nPerformance (this session):\n`;
+          for (const [modelId, stats] of session.modelStats) {
+            const avgTtft = stats.calls > 0 ? Math.round(stats.totalTtftMs / stats.calls) : 0;
+            const avgTokSec = stats.calls > 0 ? (stats.totalTokPerSec / stats.calls).toFixed(1) : '?';
+            text += `  ${modelId}: ${stats.calls} calls, avg TTFT ${avgTtft}ms, avg ${avgTokSec} tok/s\n`;
+          }
+        }
+
+        text += `${sessionStats}\n\n`;
+        text += `The local LLM is available. You can delegate tasks using chat, custom_prompt, code_task, or embed.`;
+
+        return { content: [{ type: 'text', text }] };
       }
 
       case 'list_models': {
         const models = await listModelsRaw();
         if (!models.length) {
-          return { content: [{ type: 'text', text: 'No models currently loaded.' }] };
+          return { content: [{ type: 'text', text: 'No models currently loaded or available.' }] };
         }
-        const lines = models.map((m) => {
-          const ctx = getContextLength(m);
-          return `  • ${m.id}${ctx ? ` (context: ${ctx.toLocaleString()} tokens)` : ''}`;
-        });
+
+        const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
+        const available = models.filter((m) => m.state === 'not-loaded');
+
+        let text = '';
+
+        // list_models enriches with HuggingFace data (cached after first call)
+        if (loaded.length > 0) {
+          text += `Loaded models (● ready to use):\n\n`;
+          text += (await Promise.all(loaded.map((m) => formatModelDetail(m, true)))).join('\n\n');
+        }
+
+        if (available.length > 0) {
+          if (text) text += '\n\n';
+          text += `Available models (○ downloaded, not loaded):\n\n`;
+          text += (await Promise.all(available.map((m) => formatModelDetail(m, true)))).join('\n\n');
+        }
+
+        return { content: [{ type: 'text', text }] };
+      }
+
+      case 'embed': {
+        const { input, model: embedModel } = args as { input: string; model?: string };
+
+        const embedBody: Record<string, unknown> = { input };
+        if (embedModel) {
+          embedBody.model = embedModel;
+        }
+
+        const res = await fetchWithTimeout(
+          `${LM_BASE_URL}/v1/embeddings`,
+          { method: 'POST', headers: apiHeaders(), body: JSON.stringify(embedBody) },
+          INFERENCE_CONNECT_TIMEOUT_MS,
+        );
+
+        if (!res.ok) {
+          const errText = await res.text().catch(() => '');
+          throw new Error(`Embeddings API error ${res.status}: ${errText}`);
+        }
+
+        const data = (await res.json()) as {
+          data: { embedding: number[]; index: number }[];
+          model: string;
+          usage?: { prompt_tokens: number; total_tokens: number };
+        };
+
+        const embedding = data.data[0]?.embedding;
+        if (!embedding) throw new Error('No embedding returned');
+
+        const usageInfo = data.usage
+          ? `${data.usage.prompt_tokens} tokens embedded`
+          : '';
+
         return {
-          content: [{ type: 'text', text: `Loaded models:\n${lines.join('\n')}` }],
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              model: data.model,
+              dimensions: embedding.length,
+              embedding,
+              usage: usageInfo,
+            }),
+          }],
         };
       }
 
@@ -586,6 +1066,12 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write(`Houtini LM server running (${LM_BASE_URL})\n`);
+
+  // Background: profile all available models via HF → SQLite cache
+  // Non-blocking — server is already accepting requests
+  listModelsRaw()
+    .then((models) => profileModelsAtStartup(models))
+    .catch((err) => process.stderr.write(`[houtini-lm] Startup profiling skipped: ${err}\n`));
 }
 
 main().catch((error) => {
