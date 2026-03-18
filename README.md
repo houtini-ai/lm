@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@houtini/lm.svg?style=flat-square)](https://www.npmjs.com/package/@houtini/lm)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
 [![Known Vulnerabilities](https://snyk.io/test/github/houtini-ai/lm/badge.svg)](https://snyk.io/test/github/houtini-ai/lm)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 <p align="center">
   <a href="https://glama.ai/mcp/servers/@houtini-ai/lm">
@@ -35,7 +35,7 @@ Claude Code (orchestrator)
 
 Claude's the architect. Your local model's the drafter. Claude QAs everything.
 
-Every response comes back with performance stats - TTFT, tokens per second, generation time - so you can actually see what your local hardware is doing. The session footer tracks cumulative offloaded tokens across every call.
+Every response comes back with performance stats - TTFT, tokens per second, generation time - so you can actually see what your local hardware is doing. The session footer tracks cumulative offloaded tokens across every call. Every response also includes quality signals - truncation detection, think-block stripping flags, token estimation accuracy - so Claude can make informed trust decisions about the output.
 
 ## Quick start
 
@@ -267,11 +267,55 @@ Qwen, Llama, Nemotron, GLM - they score brilliantly on coding benchmarks now. Th
 
 **Include surrounding context.** For code generation, send imports, types, and function signatures - not just the function body.
 
-**One call at a time.** If your LLM server runs a single model, parallel calls queue up and stack timeouts. Send them sequentially.
+**One call at a time.** As of v2.8.0, houtini-lm enforces this automatically with a request semaphore. Parallel calls queue up and run one at a time, so each gets the full timeout budget instead of stacking.
 
-## Think-block stripping
+## Think-block handling
 
-Some models - GLM Flash, Nemotron, and others - always emit `<think>...</think>` reasoning blocks before the actual answer. Houtini-lm strips these automatically so Claude gets clean output without wasting time parsing the model's internal chain-of-thought. You still get the benefit of the reasoning (better answers), just without the noise.
+Some models emit `<think>...</think>` reasoning blocks before the actual answer. Houtini-lm handles this in two ways:
+
+1. **Suppression at source** — at startup, houtini-lm checks each model's HuggingFace chat template for thinking support. Models that support the `enable_thinking` toggle (like Qwen3) get thinking disabled at inference time, reclaiming the generation budget for actual output. This detection is fully automatic — no hardcoded model lists.
+
+2. **Stripping as fallback** — for models that always emit think blocks regardless (GLM Flash, Nemotron), the content is stripped after assembly so Claude gets clean output. Orphaned opening tags from truncated responses are handled too.
+
+The quality footer flags `think-blocks-stripped` when stripping occurred, so you know the model was reasoning internally even though the output is clean.
+
+## Quality metadata
+
+Every response includes structured quality signals in the footer so Claude (or any orchestrator) can make informed trust decisions:
+
+```
+Model: qwen3-coder-30b-a3b | 413→81 tokens | TTFT: 2355ms, 15.0 tok/s, 5.4s
+Quality: think-blocks-stripped, tokens-estimated
+Session: 494 tokens offloaded across 1 call
+```
+
+Flags include: `TRUNCATED` (partial result), `think-blocks-stripped`, `tokens-estimated` (usage data was missing, estimated from content length), `hit-max-tokens`. When no flags fire, the quality line is omitted — clean output, nothing to report.
+
+## Session metrics resource
+
+The `houtini://metrics/session` MCP resource exposes cumulative offload stats as JSON. Claude can read this proactively to make smarter delegation decisions based on actual session performance:
+
+```json
+{
+  "session": {
+    "totalCalls": 14,
+    "promptTokens": 3200,
+    "completionTokens": 5250,
+    "totalTokensOffloaded": 8450
+  },
+  "perModel": {
+    "qwen3-coder-30b-a3b": {
+      "calls": 14,
+      "avgTtftMs": 2100,
+      "avgTokPerSec": 15.2
+    }
+  }
+}
+```
+
+## Request serialisation
+
+Parallel MCP tool calls are automatically queued and run one at a time. Most local LLM servers run a single model — without serialisation, parallel requests stack timeouts and waste the generation budget. The semaphore ensures each call gets the full timeout window.
 
 ## Configuration
 
@@ -299,9 +343,9 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 
 ## Streaming and timeouts
 
-All inference uses Server-Sent Events streaming. Tokens arrive incrementally, keeping the connection alive. If generation takes longer than 55 seconds, you get a partial result instead of a timeout error - the footer shows `TRUNCATED` when this happens.
+All inference uses Server-Sent Events streaming. Tokens arrive incrementally. As of v2.8.0, houtini-lm sends MCP progress notifications on every streamed chunk, which resets the SDK's 60-second client timeout. This means generation can run as long as the model needs — there's no hard ceiling as long as tokens keep flowing.
 
-The 55-second soft timeout exists because the MCP SDK has a hard ~60s client-side timeout. Without streaming, any response that took longer than 60 seconds just vanished. Not ideal.
+If the connection stalls (no new tokens for an extended period), you get a partial result instead of a timeout error. The footer shows `TRUNCATED` when this happens, and the quality metadata flags it so Claude knows to treat the output with appropriate caution.
 
 ## Architecture
 
@@ -327,4 +371,4 @@ npm run build
 
 ## Licence
 
-MIT
+Apache-2.0

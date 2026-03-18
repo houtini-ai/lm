@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.8.0] - 2026-03-18
+
+### Added
+- **Quality metadata** — every response includes structured quality signals (truncation, think-block detection, token estimation, finish reason) so Claude can make informed trust decisions about local LLM output
+- **Session metrics resource** — `houtini://metrics/session` MCP resource exposes cumulative offload stats and per-model performance as JSON, enabling proactive routing feedback
+- **Request semaphore** — inference calls are serialised to prevent stacked timeouts when parallel requests hit a single-model server
+
+### Fixed
+- **SQLite statement leak** in `getCachedProfile` — statement was not freed if `getAsObject()` threw (now wrapped in try/finally)
+- **Unflushed SSE buffer** — the final streaming chunk (often containing usage data) could be stranded in the buffer after loop exit, causing missing token counts on truncated responses
+- **Session stats on truncated responses** — token counts now estimated from content length (~4 chars/token) when the usage chunk is lost, instead of silently showing zero
+
 ## [2.7.0] - 2026-03-14
 
 ### Added

@@ -11,6 +11,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import {
   profileModelsAtStartup,
@@ -18,6 +20,7 @@ import {
   toModelProfile as cachedToProfile,
   getHFEnrichmentLine,
   getPromptHints,
+  getThinkingSupport,
   type PromptHints,
 } from './model-cache.js';
 
@@ -50,13 +53,16 @@ function recordUsage(resp: StreamingResult) {
   if (resp.usage) {
     session.promptTokens += resp.usage.prompt_tokens;
     session.completionTokens += resp.usage.completion_tokens;
+  } else if (resp.content.length > 0) {
+    // Estimate when usage is missing (truncated responses)
+    session.completionTokens += Math.ceil(resp.content.length / 4);
   }
   // Track per-model perf stats
   if (resp.model) {
     const existing = session.modelStats.get(resp.model) || { calls: 0, perfCalls: 0, totalTtftMs: 0, totalTokPerSec: 0 };
     existing.calls++;
     if (resp.ttftMs) existing.totalTtftMs += resp.ttftMs;
-    const tokPerSec = resp.usage && resp.generationMs > 0
+    const tokPerSec = resp.usage && resp.generationMs > 50
       ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
       : 0;
     if (tokPerSec > 0) {
@@ -79,6 +85,21 @@ function apiHeaders(): Record<string, string> {
   return h;
 }
 
+// ── Request semaphore ────────────────────────────────────────────────
+// Most local LLM servers run a single model and queue parallel requests,
+// which stacks timeouts and wastes the 55s budget. This semaphore ensures
+// only one inference call runs at a time; others wait in line.
+
+let inferenceLock: Promise<void> = Promise.resolve();
+
+function withInferenceLock<T>(fn: () => Promise<T>): Promise<T> {
+  let release: () => void;
+  const next = new Promise<void>((resolve) => { release = resolve; });
+  const wait = inferenceLock;
+  inferenceLock = next;
+  return wait.then(fn).finally(() => release!());
+}
+
 // ── OpenAI-compatible API helpers ────────────────────────────────────
 
 interface ChatMessage {
@@ -88,6 +109,8 @@ interface ChatMessage {
 
 interface StreamingResult {
   content: string;
+  /** Raw content before think-block stripping (for quality assessment) */
+  rawContent: string;
   model: string;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   finishReason: string;
@@ -402,7 +425,14 @@ async function timedRead(
  */
 async function chatCompletionStreaming(
   messages: ChatMessage[],
-  options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat } = {},
+  options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat; progressToken?: string | number } = {},
+): Promise<StreamingResult> {
+  return withInferenceLock(() => chatCompletionStreamingInner(messages, options));
+}
+
+async function chatCompletionStreamingInner(
+  messages: ChatMessage[],
+  options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat; progressToken?: string | number } = {},
 ): Promise<StreamingResult> {
   const body: Record<string, unknown> = {
     messages,
@@ -416,6 +446,17 @@ async function chatCompletionStreaming(
   }
   if (options.responseFormat) {
     body.response_format = options.responseFormat;
+  }
+
+  // Suppress thinking for models that support it — reclaim generation budget
+  // for actual output instead of invisible reasoning. Detected from HF metadata.
+  const modelId = (options.model || LM_MODEL || '').toString();
+  if (modelId) {
+    const thinking = await getThinkingSupport(modelId);
+    if (thinking?.supportsThinkingToggle) {
+      body.enable_thinking = false;
+      process.stderr.write(`[houtini-lm] Thinking disabled for ${modelId} (detected from HF chat_template)\n`);
+    }
   }
 
   const startTime = Date.now();
@@ -438,6 +479,7 @@ async function chatCompletionStreaming(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let content = '';
+  let chunkCount = 0;
   let model = '';
   let usage: StreamingResult['usage'];
   let finishReason = '';
@@ -487,6 +529,20 @@ async function chatCompletionStreaming(
           if (delta?.content) {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             content += delta.content;
+            chunkCount++;
+            // Send progress notification to reset MCP client timeout.
+            // Each notification resets the 60s clock, giving slow models
+            // unlimited time as long as they're actively generating.
+            if (options.progressToken !== undefined) {
+              server.notification({
+                method: 'notifications/progress',
+                params: {
+                  progressToken: options.progressToken,
+                  progress: chunkCount,
+                  message: `Streaming... ${content.length} chars`,
+                },
+              }).catch(() => { /* best-effort — don't break streaming */ });
+            }
           }
 
           const reason = json.choices?.[0]?.finish_reason;
@@ -496,6 +552,29 @@ async function chatCompletionStreaming(
           if (json.usage) usage = json.usage;
         } catch {
           // Skip unparseable chunks (partial JSON, comments, etc.)
+        }
+      }
+    }
+
+    // Flush remaining buffer — the usage chunk often arrives in the final SSE
+    // message and may not have a trailing newline, leaving it stranded in buffer.
+    if (buffer.trim()) {
+      const trimmed = buffer.trim();
+      if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
+        try {
+          const json = JSON.parse(trimmed.slice(6));
+          if (json.model) model = json.model;
+          const delta = json.choices?.[0]?.delta;
+          if (delta?.content) {
+            if (ttftMs === undefined) ttftMs = Date.now() - startTime;
+            content += delta.content;
+          }
+          const reason = json.choices?.[0]?.finish_reason;
+          if (reason) finishReason = reason;
+          if (json.usage) usage = json.usage;
+        } catch (e) {
+          // Incomplete JSON in final buffer — log for diagnostics
+          process.stderr.write(`[houtini-lm] Unflushed buffer parse failed (${buffer.length} bytes): ${e}\n`);
         }
       }
     }
@@ -514,7 +593,7 @@ async function chatCompletionStreaming(
   cleanContent = cleanContent.replace(/^<think>\s*/, '');                   // orphaned opening tag
   cleanContent = cleanContent.trim();
 
-  return { content: cleanContent, model, usage, finishReason, truncated, ttftMs, generationMs };
+  return { content: cleanContent, rawContent: content, model, usage, finishReason, truncated, ttftMs, generationMs };
 }
 
 /**
@@ -632,6 +711,50 @@ async function routeToModel(taskType: TaskType): Promise<RoutingDecision> {
   return result;
 }
 
+// ── Quality metadata ─────────────────────────────────────────────────
+// Provides structured quality signals in every response so Claude (or any
+// orchestrator) can make informed trust decisions about the local LLM output.
+// Addresses: GitHub issue #3 (automated quality checks), dev.to feedback
+// on leaked think-blocks and token offload metrics as routing feedback.
+
+interface QualitySignal {
+  truncated: boolean;
+  finishReason: string;
+  thinkBlocksStripped: boolean;
+  estimatedTokens: boolean;   // true when usage was missing and we estimated
+  contentLength: number;
+  generationMs: number;
+  tokPerSec: number | null;
+}
+
+function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal {
+  const hadThinkBlocks = /<think>/.test(rawContent);
+  const estimated = !resp.usage && resp.content.length > 0;
+  const tokPerSec = resp.usage && resp.generationMs > 50
+    ? resp.usage.completion_tokens / (resp.generationMs / 1000)
+    : null;
+
+  return {
+    truncated: resp.truncated,
+    finishReason: resp.finishReason || 'unknown',
+    thinkBlocksStripped: hadThinkBlocks,
+    estimatedTokens: estimated,
+    contentLength: resp.content.length,
+    generationMs: resp.generationMs,
+    tokPerSec,
+  };
+}
+
+function formatQualityLine(quality: QualitySignal): string {
+  const flags: string[] = [];
+  if (quality.truncated) flags.push('TRUNCATED');
+  if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
+  if (quality.estimatedTokens) flags.push('tokens-estimated');
+  if (quality.finishReason === 'length') flags.push('hit-max-tokens');
+  if (flags.length === 0) return '';
+  return `Quality: ${flags.join(', ')}`;
+}
+
 /**
  * Format a footer line for streaming results showing model, usage, and truncation status.
  */
@@ -641,12 +764,18 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
 
   const parts: string[] = [];
   if (resp.model) parts.push(`Model: ${resp.model}`);
-  if (resp.usage) parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
+  if (resp.usage) {
+    parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
+  } else if (resp.content.length > 0) {
+    // Estimate when usage is missing (truncated responses where final SSE chunk was lost)
+    const estTokens = Math.ceil(resp.content.length / 4);
+    parts.push(`~${estTokens} tokens (estimated)`);
+  }
 
   // Perf stats — computed from streaming, no proprietary API needed
   const perfParts: string[] = [];
   if (resp.ttftMs !== undefined) perfParts.push(`TTFT: ${resp.ttftMs}ms`);
-  if (resp.usage && resp.generationMs > 0) {
+  if (resp.usage && resp.generationMs > 50) {
     const tokPerSec = resp.usage.completion_tokens / (resp.generationMs / 1000);
     perfParts.push(`${tokPerSec.toFixed(1)} tok/s`);
   }
@@ -654,6 +783,11 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   if (perfParts.length > 0) parts.push(perfParts.join(', '));
 
   if (extra) parts.push(extra);
+
+  // Quality signals — structured metadata for orchestrator trust decisions
+  const quality = assessQuality(resp, resp.rawContent);
+  const qualityLine = formatQualityLine(quality);
+  if (qualityLine) parts.push(qualityLine);
   if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
 
   const sessionLine = sessionSummary();
@@ -854,14 +988,66 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.7.0' },
-  { capabilities: { tools: {} } },
+  { name: 'houtini-lm', version: '2.8.0' },
+  { capabilities: { tools: {}, resources: {} } },
 );
+
+// ── MCP Resources ─────────────────────────────────────────────────────
+// Exposes session performance metrics as a readable resource so Claude can
+// proactively check offload efficiency and make smarter delegation decisions.
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [
+    {
+      uri: 'houtini://metrics/session',
+      name: 'Session Offload Metrics',
+      description: 'Cumulative token offload stats, per-model performance, and quality signals for the current session.',
+      mimeType: 'application/json',
+    },
+  ],
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const { uri } = request.params;
+
+  if (uri === 'houtini://metrics/session') {
+    const modelStats: Record<string, { calls: number; avgTtftMs: number; avgTokPerSec: number | null }> = {};
+    for (const [modelId, stats] of session.modelStats) {
+      modelStats[modelId] = {
+        calls: stats.calls,
+        avgTtftMs: stats.calls > 0 ? Math.round(stats.totalTtftMs / stats.calls) : 0,
+        avgTokPerSec: stats.perfCalls > 0 ? parseFloat((stats.totalTokPerSec / stats.perfCalls).toFixed(1)) : null,
+      };
+    }
+
+    const metrics = {
+      session: {
+        totalCalls: session.calls,
+        promptTokens: session.promptTokens,
+        completionTokens: session.completionTokens,
+        totalTokensOffloaded: session.promptTokens + session.completionTokens,
+      },
+      perModel: modelStats,
+      endpoint: LM_BASE_URL,
+    };
+
+    return {
+      contents: [{
+        uri,
+        mimeType: 'application/json',
+        text: JSON.stringify(metrics, null, 2),
+      }],
+    };
+  }
+
+  throw new Error(`Unknown resource: ${uri}`);
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const progressToken = request.params._meta?.progressToken;
 
   try {
     switch (name) {
@@ -892,6 +1078,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxTokens: max_tokens,
           model: route.modelId,
           responseFormat,
+          progressToken,
         });
 
         const footer = formatFooter(resp);
@@ -915,9 +1102,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : (route.hints.outputConstraint || undefined);
         if (systemContent) messages.push({ role: 'system', content: systemContent });
 
-        let userContent = instruction;
-        if (context) userContent = `Context:\n${context}\n\nInstruction:\n${instruction}`;
-        messages.push({ role: 'user', content: userContent });
+        // Multi-turn format prevents context bleed in smaller models.
+        // Context goes in a separate user→assistant exchange so the model
+        // "acknowledges" it before receiving the actual instruction.
+        if (context) {
+          messages.push({ role: 'user', content: `Here is the context for analysis:\n\n${context}` });
+          messages.push({ role: 'assistant', content: 'Understood. I have read the full context. What would you like me to do with it?' });
+        }
+        messages.push({ role: 'user', content: instruction });
 
         const responseFormat: ResponseFormat | undefined = json_schema
           ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
@@ -928,6 +1120,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxTokens: max_tokens,
           model: route.modelId,
           responseFormat,
+          progressToken,
         });
 
         const footer = formatFooter(resp);
@@ -950,14 +1143,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? ` ${route.hints.outputConstraint}`
           : '';
 
+        // Task goes in system message so smaller models don't lose it once
+        // the code block fills the attention window. Code is sole user content.
         const codeMessages: ChatMessage[] = [
           {
             role: 'system',
-            content: `Expert ${lang} developer. Analyse the provided code and complete the task. Be specific — reference line numbers, function names, and concrete fixes.${outputConstraint}`,
+            content: `Expert ${lang} developer. Your task: ${task}\n\nBe specific — reference line numbers, function names, and concrete fixes. Output your analysis as a markdown list.${outputConstraint}`,
           },
           {
             role: 'user',
-            content: `Task: ${task}\n\n\`\`\`${lang}\n${code}\n\`\`\``,
+            content: `\`\`\`${lang}\n${code}\n\`\`\``,
           },
         ];
 
@@ -965,6 +1160,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           temperature: route.hints.codeTemp,
           maxTokens: codeMaxTokens ?? DEFAULT_MAX_TOKENS,
           model: route.modelId,
+          progressToken,
         });
 
         const codeFooter = formatFooter(codeResp, lang);
@@ -1083,46 +1279,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'embed': {
         const { input, model: embedModel } = args as { input: string; model?: string };
 
-        const embedBody: Record<string, unknown> = { input };
-        if (embedModel) {
-          embedBody.model = embedModel;
-        }
+        return await withInferenceLock(async () => {
+          const embedBody: Record<string, unknown> = { input };
+          if (embedModel) {
+            embedBody.model = embedModel;
+          }
 
-        const res = await fetchWithTimeout(
-          `${LM_BASE_URL}/v1/embeddings`,
-          { method: 'POST', headers: apiHeaders(), body: JSON.stringify(embedBody) },
-          INFERENCE_CONNECT_TIMEOUT_MS,
-        );
+          const res = await fetchWithTimeout(
+            `${LM_BASE_URL}/v1/embeddings`,
+            { method: 'POST', headers: apiHeaders(), body: JSON.stringify(embedBody) },
+            INFERENCE_CONNECT_TIMEOUT_MS,
+          );
 
-        if (!res.ok) {
-          const errText = await res.text().catch(() => '');
-          throw new Error(`Embeddings API error ${res.status}: ${errText}`);
-        }
+          if (!res.ok) {
+            const errText = await res.text().catch(() => '');
+            throw new Error(`Embeddings API error ${res.status}: ${errText}`);
+          }
 
-        const data = (await res.json()) as {
-          data: { embedding: number[]; index: number }[];
-          model: string;
-          usage?: { prompt_tokens: number; total_tokens: number };
-        };
+          const data = (await res.json()) as {
+            data: { embedding: number[]; index: number }[];
+            model: string;
+            usage?: { prompt_tokens: number; total_tokens: number };
+          };
 
-        const embedding = data.data[0]?.embedding;
-        if (!embedding) throw new Error('No embedding returned');
+          const embedding = data.data[0]?.embedding;
+          if (!embedding) throw new Error('No embedding returned');
 
-        const usageInfo = data.usage
-          ? `${data.usage.prompt_tokens} tokens embedded`
-          : '';
+          const usageInfo = data.usage
+            ? `${data.usage.prompt_tokens} tokens embedded`
+            : '';
 
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              model: data.model,
-              dimensions: embedding.length,
-              embedding,
-              usage: usageInfo,
-            }),
-          }],
-        };
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                model: data.model,
+                dimensions: embedding.length,
+                embedding,
+                usage: usageInfo,
+              }),
+            }],
+          };
+        });
       }
 
       default:

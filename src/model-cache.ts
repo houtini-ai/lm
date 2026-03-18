@@ -30,6 +30,9 @@ export interface CachedModelProfile {
   strengths: string | null;         // JSON array string
   weaknesses: string | null;        // JSON array string
   bestFor: string | null;           // JSON array string
+  // Thinking / reasoning capability (detected from HF chat_template)
+  emitsThinkBlocks: boolean;        // model outputs <think> blocks
+  supportsThinkingToggle: boolean;  // supports enable_thinking param to suppress thinking
   // Cache metadata
   fetchedAt: number;                // Unix timestamp ms
   source: 'huggingface' | 'static' | 'inferred';
@@ -53,8 +56,6 @@ export interface PromptHints {
   chatTemp: number;
   /** Extra system prompt suffix to constrain output format */
   outputConstraint: string;
-  /** Whether this model emits <think> blocks that need stripping */
-  emitsThinkBlocks: boolean;
   /** Task types this model excels at (for routing) */
   bestTaskTypes: ('code' | 'chat' | 'analysis' | 'embedding')[];
 }
@@ -65,8 +66,8 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
     hints: {
       codeTemp: 0.1,
       chatTemp: 0.3,
-      outputConstraint: 'Respond with ONLY the requested output. No step-by-step reasoning. No numbered analysis. No preamble. Go straight to the answer.',
-      emitsThinkBlocks: true,
+      outputConstraint: 'Respond with ONLY the requested output. No step-by-step reasoning. No preamble. Use markdown formatting: bullet points for lists, fenced code blocks for code.',
+
       bestTaskTypes: ['chat', 'analysis'],
     },
   },
@@ -75,8 +76,8 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
     hints: {
       codeTemp: 0.1,
       chatTemp: 0.3,
-      outputConstraint: 'Be direct. Output only what was asked for.',
-      emitsThinkBlocks: true,
+      outputConstraint: 'Be direct. Output only what was asked for. Use markdown formatting: bullet points for lists, fenced code blocks for code. No preamble.',
+
       bestTaskTypes: ['code'],
     },
   },
@@ -85,8 +86,8 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
     hints: {
       codeTemp: 0.2,
       chatTemp: 0.3,
-      outputConstraint: 'Be direct. Output only what was asked for.',
-      emitsThinkBlocks: true,
+      outputConstraint: 'Be direct. Output only what was asked for. Use markdown formatting: bullet points for lists, fenced code blocks for code. No preamble.',
+
       bestTaskTypes: ['chat', 'analysis', 'code'],
     },
   },
@@ -96,7 +97,7 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
       codeTemp: 0.2,
       chatTemp: 0.4,
       outputConstraint: '',
-      emitsThinkBlocks: false,
+
       bestTaskTypes: ['chat', 'code', 'analysis'],
     },
   },
@@ -106,7 +107,7 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
       codeTemp: 0.1,
       chatTemp: 0.3,
       outputConstraint: '',
-      emitsThinkBlocks: true,
+
       bestTaskTypes: ['analysis', 'code'],
     },
   },
@@ -116,7 +117,7 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
       codeTemp: 0.2,
       chatTemp: 0.3,
       outputConstraint: '',
-      emitsThinkBlocks: false,
+
       bestTaskTypes: ['code', 'chat'],
     },
   },
@@ -126,7 +127,7 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
       codeTemp: 0.2,
       chatTemp: 0.4,
       outputConstraint: '',
-      emitsThinkBlocks: false,
+
       bestTaskTypes: ['chat', 'code', 'analysis'],
     },
   },
@@ -136,7 +137,7 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
       codeTemp: 0,
       chatTemp: 0,
       outputConstraint: '',
-      emitsThinkBlocks: false,
+
       bestTaskTypes: ['embedding'],
     },
   },
@@ -155,7 +156,6 @@ export function getPromptHints(modelId: string, arch?: string): PromptHints {
     codeTemp: 0.2,
     chatTemp: 0.3,
     outputConstraint: '',
-    emitsThinkBlocks: false,
     bestTaskTypes: ['chat', 'code', 'analysis'],
   };
 }
@@ -205,10 +205,20 @@ export async function initDb(): Promise<Database> {
       strengths TEXT,
       weaknesses TEXT,
       best_for TEXT,
+      emits_think_blocks INTEGER NOT NULL DEFAULT 0,
+      supports_thinking_toggle INTEGER NOT NULL DEFAULT 0,
       fetched_at INTEGER NOT NULL,
       source TEXT NOT NULL DEFAULT 'huggingface'
     )
   `);
+
+  // Migrate: add thinking columns if upgrading from older schema
+  try {
+    db.run('ALTER TABLE model_profiles ADD COLUMN emits_think_blocks INTEGER NOT NULL DEFAULT 0');
+  } catch { /* column already exists */ }
+  try {
+    db.run('ALTER TABLE model_profiles ADD COLUMN supports_thinking_toggle INTEGER NOT NULL DEFAULT 0');
+  } catch { /* column already exists */ }
 
   return db;
 }
@@ -229,31 +239,35 @@ function saveDb(): void {
 export async function getCachedProfile(modelId: string): Promise<CachedModelProfile | null> {
   const database = await initDb();
   const stmt = database.prepare('SELECT * FROM model_profiles WHERE model_id = ?');
-  stmt.bind([modelId]);
+  try {
+    stmt.bind([modelId]);
 
-  if (stmt.step()) {
-    const row = stmt.getAsObject() as Record<string, unknown>;
+    if (stmt.step()) {
+      const row = stmt.getAsObject() as Record<string, unknown>;
+      return {
+        modelId: row.model_id as string,
+        hfId: row.hf_id as string | null,
+        pipelineTag: row.pipeline_tag as string | null,
+        architectures: row.architectures as string | null,
+        license: row.license as string | null,
+        downloads: row.downloads as number | null,
+        likes: row.likes as number | null,
+        libraryName: row.library_name as string | null,
+        family: row.family as string | null,
+        description: row.description as string | null,
+        strengths: row.strengths as string | null,
+        weaknesses: row.weaknesses as string | null,
+        bestFor: row.best_for as string | null,
+        emitsThinkBlocks: !!(row.emits_think_blocks as number),
+        supportsThinkingToggle: !!(row.supports_thinking_toggle as number),
+        fetchedAt: row.fetched_at as number,
+        source: row.source as 'huggingface' | 'static' | 'inferred',
+      };
+    }
+    return null;
+  } finally {
     stmt.free();
-    return {
-      modelId: row.model_id as string,
-      hfId: row.hf_id as string | null,
-      pipelineTag: row.pipeline_tag as string | null,
-      architectures: row.architectures as string | null,
-      license: row.license as string | null,
-      downloads: row.downloads as number | null,
-      likes: row.likes as number | null,
-      libraryName: row.library_name as string | null,
-      family: row.family as string | null,
-      description: row.description as string | null,
-      strengths: row.strengths as string | null,
-      weaknesses: row.weaknesses as string | null,
-      bestFor: row.best_for as string | null,
-      fetchedAt: row.fetched_at as number,
-      source: row.source as 'huggingface' | 'static' | 'inferred',
-    };
   }
-  stmt.free();
-  return null;
 }
 
 /**
@@ -265,8 +279,8 @@ export async function upsertProfile(profile: CachedModelProfile, skipSave = fals
   database.run(
     `INSERT OR REPLACE INTO model_profiles
      (model_id, hf_id, pipeline_tag, architectures, license, downloads, likes, library_name,
-      family, description, strengths, weaknesses, best_for, fetched_at, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      family, description, strengths, weaknesses, best_for, emits_think_blocks, supports_thinking_toggle, fetched_at, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       profile.modelId,
       profile.hfId,
@@ -281,6 +295,8 @@ export async function upsertProfile(profile: CachedModelProfile, skipSave = fals
       profile.strengths,
       profile.weaknesses,
       profile.bestFor,
+      profile.emitsThinkBlocks ? 1 : 0,
+      profile.supportsThinkingToggle ? 1 : 0,
       profile.fetchedAt,
       profile.source,
     ],
@@ -323,6 +339,10 @@ interface HFModelCard {
   config?: {
     model_type?: string;
     architectures?: string[];
+    tokenizer_config?: {
+      chat_template?: string;
+      [key: string]: unknown;
+    };
     [key: string]: unknown;
   };
   cardData?: {
@@ -330,6 +350,23 @@ interface HFModelCard {
     language?: string | string[];
     [key: string]: unknown;
   };
+}
+
+/**
+ * Detect thinking/reasoning support from HF model metadata.
+ * Checks the chat_template for enable_thinking and <think> patterns,
+ * rather than hardcoding per-family knowledge.
+ */
+function detectThinkingSupport(card: HFModelCard): { emitsThinkBlocks: boolean; supportsThinkingToggle: boolean } {
+  const chatTemplate = card.config?.tokenizer_config?.chat_template || '';
+
+  // Does the template reference <think> blocks at all?
+  const emitsThinkBlocks = /<think>/.test(chatTemplate) || /thinking/.test(chatTemplate.toLowerCase());
+
+  // Does the template support enable_thinking toggle? (Qwen3 pattern)
+  const supportsThinkingToggle = /enable_thinking/.test(chatTemplate);
+
+  return { emitsThinkBlocks, supportsThinkingToggle };
 }
 
 async function fetchHF(url: string): Promise<Response> {
@@ -421,12 +458,16 @@ function inferProfileFromHF(card: HFModelCard, modelId: string): Partial<CachedM
   if (strengths.length === 0) strengths.push('general reasoning');
   if (bestFor.length === 0) bestFor.push('general delegation');
 
+  const thinking = detectThinkingSupport(card);
+
   return {
     family,
     description,
     strengths: JSON.stringify(strengths),
     weaknesses: JSON.stringify(weaknesses),
     bestFor: JSON.stringify(bestFor),
+    emitsThinkBlocks: thinking.emitsThinkBlocks,
+    supportsThinkingToggle: thinking.supportsThinkingToggle,
   };
 }
 
@@ -521,6 +562,8 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
           strengths: inferred.strengths || null,
           weaknesses: inferred.weaknesses || null,
           bestFor: inferred.bestFor || null,
+          emitsThinkBlocks: inferred.emitsThinkBlocks || false,
+          supportsThinkingToggle: inferred.supportsThinkingToggle || false,
           fetchedAt: Date.now(),
           source: 'huggingface',
         }, true);
@@ -541,6 +584,8 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
           strengths: null,
           weaknesses: null,
           bestFor: null,
+          emitsThinkBlocks: false,
+          supportsThinkingToggle: false,
           fetchedAt: Date.now(),
           source: 'inferred',
         }, true);
@@ -604,10 +649,22 @@ export async function getAllCachedProfiles(): Promise<CachedModelProfile[]> {
       strengths: row.strengths as string | null,
       weaknesses: row.weaknesses as string | null,
       bestFor: row.best_for as string | null,
+      emitsThinkBlocks: !!(row.emits_think_blocks as number),
+      supportsThinkingToggle: !!(row.supports_thinking_toggle as number),
       fetchedAt: row.fetched_at as number,
       source: row.source as 'huggingface' | 'static' | 'inferred',
     });
   }
   stmt.free();
   return results;
+}
+
+/**
+ * Query thinking support for a model from the cache.
+ * Returns null if model is not cached.
+ */
+export async function getThinkingSupport(modelId: string): Promise<{ emitsThinkBlocks: boolean; supportsThinkingToggle: boolean } | null> {
+  const cached = await getCachedProfile(modelId);
+  if (!cached) return null;
+  return { emitsThinkBlocks: cached.emitsThinkBlocks, supportsThinkingToggle: cached.supportsThinkingToggle };
 }
