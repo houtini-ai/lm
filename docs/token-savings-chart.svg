@@ -1,0 +1,52 @@
+<svg viewBox="0 0 900 500" xmlns="http://www.w3.org/2000/svg" width="100%" preserveAspectRatio="xMidYMid meet">
+  <title>Claude Token Savings with Local LLM Delegation</title>
+  <desc>Horizontal bar chart showing massive token savings when delegating tasks to local LLMs.</desc>
+  
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; fill: #e2e8f0; }
+    .title { font-size: 28px; font-weight: bold; fill: #ffffff; }
+    .label { font-size: 16px; fill: #94a3b8; }
+    .value { font-size: 14px; fill: #cbd5e1; }
+    .pct { font-size: 18px; font-weight: bold; fill: #2dd4bf; }
+    .avg { font-size: 24px; font-weight: bold; fill: #2dd4bf; }
+    .footer { font-size: 12px; fill: #64748b; }
+  </style>
+
+  <!-- Background -->
+  <rect width="900" height="500" fill="#1a1a2e" />
+
+  <!-- Title -->
+  <text x="450" y="50" text-anchor="middle" class="title">Claude Token Savings with Local LLM Delegation</text>
+
+  <!-- Row 1: Code Review -->
+  <text x="240" y="135" text-anchor="end" class="label">Code Review (1352 lines)<tspan x="820" text-anchor="start" class="pct">95% saved</tspan></text>
+  <rect x="250" y="120" width="398" height="20" rx="4" fill="#ff7f50" />
+  <rect x="250" y="145" width="21" height="20" rx="4" fill="#2dd4bf" />
+
+  <!-- Row 2: Architecture Review -->
+  <text x="240" y="210" text-anchor="end" class="label">Architecture Review (2022 lines)<tspan x="820" text-anchor="start" class="pct">95% saved</tspan></text>
+  <rect x="250" y="195" width="550" height="20" rx="4" fill="#ff7f50" />
+  <rect x="250" y="220" width="27" height="20" rx="4" fill="#2dd4bf" />
+
+  <!-- Row 3: External Repo Review -->
+  <text x="240" y="285" text-anchor="end" class="label">External Repo Review (581 lines)<tspan x="820" text-anchor="start" class="pct">86% saved</tspan></text>
+  <rect x="250" y="270" width="147" height="20" rx="4" fill="#ff7f50" />
+  <rect x="250" y="295" width="20" height="20" rx="4" fill="#2dd4bf" />
+
+  <!-- Row 4: Code Explanation -->
+  <text x="240" y="360" text-anchor="end" class="label">Code Explanation (833 lines)<tspan x="820" text-anchor="start" class="pct">91% saved</tspan></text>
+  <rect x="250" y="345" width="238" height="20" rx="4" fill="#ff7f50" />
+  <rect x="250" y="370" width="20" height="20" rx="4" fill="#2dd4bf" />
+
+  <!-- Legend -->
+  <circle cx="255" cy="435" r="6" fill="#ff7f50" />
+  <circle cx="365" cy="435" r="6" fill="#2dd4bf" />
+  <text x="268" y="440" class="value">Claude Direct</text>
+  <text x="378" y="440" class="value">Delegated</text>
+
+  <!-- Summary Callout -->
+  <text x="820" y="440" text-anchor="end" class="avg">93.3% average savings</text>
+
+  <!-- Footer -->
+  <text x="450" y="480" text-anchor="middle" class="footer">houtini-lm benchmark | Real TypeScript source files</text>
+</svg>
