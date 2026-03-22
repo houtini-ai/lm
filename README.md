@@ -11,6 +11,10 @@
   </a>
 </p>
 
+> **Quick Navigation**
+>
+> [How it works](#how-it-works) | [Token savings](#token-savings--benchmarked) | [Quick start](#quick-start) | [What gets offloaded](#what-gets-offloaded) | [Tools](#tools) | [Model routing](#model-routing) | [Configuration](#configuration) | [Compatible endpoints](#compatible-endpoints)
+
 I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need Claude's reasoning or tool access.
 
 Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-compatible API. Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to whatever cheaper model you've got running. Free. No rate limits. Private.
