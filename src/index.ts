@@ -27,7 +27,7 @@ import {
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
 const LM_PASSWORD = process.env.LM_STUDIO_PASSWORD || '';
-const DEFAULT_MAX_TOKENS = 64000;             // generous default — local models have large context windows, don't ration
+const DEFAULT_MAX_TOKENS = 16384;             // fallback when model context is unknown — overridden by dynamic calculation below
 const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
 const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
@@ -430,14 +430,33 @@ async function chatCompletionStreaming(
   return withInferenceLock(() => chatCompletionStreamingInner(messages, options));
 }
 
+/** Get the first loaded model's info for context-aware defaults. */
+async function getActiveModel(): Promise<ModelInfo | null> {
+  try {
+    const models = await listModelsRaw();
+    return models.find((m: ModelInfo) => m.state === 'loaded') ?? models[0] ?? null;
+  } catch { return null; }
+}
+
 async function chatCompletionStreamingInner(
   messages: ChatMessage[],
   options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat; progressToken?: string | number } = {},
 ): Promise<StreamingResult> {
+  // Derive max_tokens from the model's actual context window when not explicitly set.
+  // Uses 25% of context as a generous output budget (e.g. 262K context → 65K output).
+  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
+  if (!options.maxTokens) {
+    const activeModel = await getActiveModel();
+    if (activeModel) {
+      const ctx = getContextLength(activeModel);
+      effectiveMaxTokens = Math.floor(ctx * 0.25);
+    }
+  }
+
   const body: Record<string, unknown> = {
     messages,
     temperature: options.temperature ?? DEFAULT_TEMPERATURE,
-    max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
+    max_tokens: effectiveMaxTokens,
     stream: true,
     stream_options: { include_usage: true },
   };
