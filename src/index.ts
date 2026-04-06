@@ -27,7 +27,7 @@ import {
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
 const LM_PASSWORD = process.env.LM_STUDIO_PASSWORD || '';
-const DEFAULT_MAX_TOKENS = 2048;
+const DEFAULT_MAX_TOKENS = 64000;             // generous default — local models have large context windows, don't ration
 const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
 const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
