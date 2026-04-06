@@ -31,7 +31,7 @@ const DEFAULT_MAX_TOKENS = 2048;
 const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
 const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
-const SOFT_TIMEOUT_MS = 55_000;              // return partial results before MCP SDK ~60s timeout
+const SOFT_TIMEOUT_MS = 300_000;             // 5 min — progress notifications reset MCP client timeout, so this is a safety net not the primary limit
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk
 const FALLBACK_CONTEXT_LENGTH = parseInt(process.env.LM_CONTEXT_WINDOW || '100000', 10);
 
@@ -526,6 +526,25 @@ async function chatCompletionStreamingInner(
           if (json.model) model = json.model;
 
           const delta = json.choices?.[0]?.delta;
+
+          // Track reasoning/thinking tokens — models like Gemma 4, Qwen3, DeepSeek
+          // emit reasoning_content during their thinking phase before producing
+          // visible content. We must send progress notifications during this phase
+          // to prevent MCP client timeout.
+          if (delta?.reasoning_content) {
+            chunkCount++;
+            if (options.progressToken !== undefined) {
+              server.notification({
+                method: 'notifications/progress',
+                params: {
+                  progressToken: options.progressToken,
+                  progress: chunkCount,
+                  message: `Thinking... (${chunkCount} chunks)`,
+                },
+              }).catch(() => { /* best-effort */ });
+            }
+          }
+
           if (delta?.content) {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             content += delta.content;
