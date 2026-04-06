@@ -448,14 +448,24 @@ async function chatCompletionStreamingInner(
     body.response_format = options.responseFormat;
   }
 
-  // Suppress thinking for models that support it — reclaim generation budget
-  // for actual output instead of invisible reasoning. Detected from HF metadata.
+  // Handle thinking/reasoning models.
+  // Some models (Gemma 4, Qwen3, DeepSeek) have extended thinking that consumes
+  // part of the max_tokens budget for invisible reasoning before producing content.
+  // Strategy: try to disable thinking via enable_thinking=false, BUT also inflate
+  // max_tokens as a safety net since some models (Gemma 4) hardcode thinking=true
+  // in their Jinja template and ignore the API parameter.
   const modelId = (options.model || LM_MODEL || '').toString();
   if (modelId) {
     const thinking = await getThinkingSupport(modelId);
     if (thinking?.supportsThinkingToggle) {
       body.enable_thinking = false;
-      process.stderr.write(`[houtini-lm] Thinking disabled for ${modelId} (detected from HF chat_template)\n`);
+      // Safety net: inflate max_tokens to account for reasoning budget.
+      // Gemma 4 ignores enable_thinking=false (hardcoded in template),
+      // so the model will think regardless. Without inflation, reasoning
+      // consumes all tokens and content comes back empty.
+      const requestedTokens = (options.maxTokens ?? DEFAULT_MAX_TOKENS);
+      body.max_tokens = Math.max(requestedTokens * 4, requestedTokens + 2000);
+      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: enable_thinking=false, max_tokens inflated ${requestedTokens} → ${body.max_tokens}\n`);
     }
   }
 
