@@ -354,19 +354,60 @@ interface HFModelCard {
 
 /**
  * Detect thinking/reasoning support from HF model metadata.
- * Checks the chat_template for enable_thinking and <think> patterns,
- * rather than hardcoding per-family knowledge.
+ * Uses chat_template patterns first, then falls back to architecture-based
+ * detection for gated models (e.g. Gemma 4) where HF metadata is unavailable.
  */
 function detectThinkingSupport(card: HFModelCard): { emitsThinkBlocks: boolean; supportsThinkingToggle: boolean } {
   const chatTemplate = card.config?.tokenizer_config?.chat_template || '';
 
   // Does the template reference <think> blocks at all?
-  const emitsThinkBlocks = /<think>/.test(chatTemplate) || /thinking/.test(chatTemplate.toLowerCase());
+  let emitsThinkBlocks = /<think>/.test(chatTemplate) || /thinking/.test(chatTemplate.toLowerCase());
 
   // Does the template support enable_thinking toggle? (Qwen3 pattern)
-  const supportsThinkingToggle = /enable_thinking/.test(chatTemplate);
+  let supportsThinkingToggle = /enable_thinking/.test(chatTemplate);
+
+  // Architecture-based fallback for gated models where chat_template is unavailable.
+  // These models have extended thinking by default and support disabling it.
+  if (!supportsThinkingToggle) {
+    const arch = card.config?.architectures?.[0] || '';
+    const archLower = arch.toLowerCase();
+    if (
+      archLower.includes('gemma4') ||                      // Gemma 4 family
+      archLower.includes('gemma4forconditionalgener')       // Gemma4ForConditionalGeneration
+    ) {
+      emitsThinkBlocks = true;
+      supportsThinkingToggle = true;
+    }
+  }
 
   return { emitsThinkBlocks, supportsThinkingToggle };
+}
+
+/**
+ * Detect thinking support from LM Studio model metadata alone (no HF card).
+ * Used when HF lookup fails (gated models, offline, etc.).
+ */
+function detectThinkingSupportFromArch(arch: string, modelId: string): { emitsThinkBlocks: boolean; supportsThinkingToggle: boolean } {
+  const archLower = (arch || '').toLowerCase();
+  const idLower = (modelId || '').toLowerCase();
+
+  // Models known to have extended thinking that can be disabled
+  const thinkingArchitectures = [
+    'gemma4',       // Gemma 4 (uses reasoning_effort / enable_thinking)
+  ];
+
+  const thinkingIdPatterns = [
+    /gemma-4/i,     // google/gemma-4-26b-a4b etc.
+    /gemma4/i,
+  ];
+
+  const isThinking = thinkingArchitectures.some(a => archLower.includes(a))
+    || thinkingIdPatterns.some(p => p.test(idLower));
+
+  return {
+    emitsThinkBlocks: isThinking,
+    supportsThinkingToggle: isThinking,
+  };
 }
 
 async function fetchHF(url: string): Promise<Response> {
@@ -569,7 +610,12 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
         }, true);
         profiledCount++;
       } else {
-        // No HF match — cache a minimal profile so we don't retry
+        // No HF match — cache a minimal profile so we don't retry.
+        // Use architecture-based thinking detection as fallback for gated models.
+        const thinking = detectThinkingSupportFromArch(model.arch || '', model.id);
+        if (thinking.supportsThinkingToggle) {
+          process.stderr.write(`[houtini-lm] Detected thinking model from arch/id: ${model.id} (arch: ${model.arch}) — will suppress thinking\n`);
+        }
         await upsertProfile({
           modelId: model.id,
           hfId: null,
@@ -584,8 +630,8 @@ export async function profileModelsAtStartup(models: ModelInfoForCache[]): Promi
           strengths: null,
           weaknesses: null,
           bestFor: null,
-          emitsThinkBlocks: false,
-          supportsThinkingToggle: false,
+          emitsThinkBlocks: thinking.emitsThinkBlocks,
+          supportsThinkingToggle: thinking.supportsThinkingToggle,
           fetchedAt: Date.now(),
           source: 'inferred',
         }, true);
