@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.9.0] - 2026-04-16
+
+### Added
+- **`code_task_files` tool** (#4) — accepts absolute file paths; the server reads and concatenates them server-side so source never passes through the MCP client's context window. Uses `Promise.allSettled` so one unreadable file doesn't sink the call; failures are surfaced inline.
+- **Dynamic `max_tokens`** (#5) — derived from the active model's loaded context window (25%, e.g. 262K ctx → 65K output) when the caller doesn't pass an explicit budget. Falls back to 16384 when context is unknown.
+- **Progress notifications during reasoning** (#5) — each streamed chunk sends a progress notification during the thinking phase too, resetting the client's 60s clock so big-input + slow-TTFT calls don't time out.
+- **Thinking-model detection for gated HuggingFace repos** — including Gemma 4.
+
+### Fixed
+- **Empty response body from thinking models** (#6) — two-layer fix:
+  1. For models that support thinking toggle, inflate `max_tokens` by 4× (minimum +2000) so reasoning doesn't starve content generation. Gemma 4 hardcodes `enable_thinking=true` in its Jinja template and ignores the API flag, so this inflation is the real fix.
+  2. Safety net: if the `<think>` stripper still ends up with an empty `cleanContent` (MLX/GGUF quants that ignore the flag entirely), return the raw output with a `think-strip-empty` quality flag instead of an empty body + lone footer.
+- **Default soft timeout** raised to 5 minutes — progress notifications reset the MCP client's 60s clock, so the soft timeout is now a safety net rather than the primary limit.
+
 ## [2.8.0] - 2026-03-18
 
 ### Added

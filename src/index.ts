@@ -23,6 +23,8 @@ import {
   getThinkingSupport,
   type PromptHints,
 } from './model-cache.js';
+import { readFile } from 'node:fs/promises';
+import { isAbsolute, basename } from 'node:path';
 
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
@@ -119,6 +121,8 @@ interface StreamingResult {
   ttftMs?: number;
   /** Total generation time in milliseconds */
   generationMs: number;
+  /** True when think-block stripping left nothing and we fell back to raw content */
+  thinkStripFallback?: boolean;
 }
 
 /** OpenAI-compatible response_format for structured output */
@@ -641,7 +645,18 @@ async function chatCompletionStreamingInner(
   cleanContent = cleanContent.replace(/^<think>\s*/, '');                   // orphaned opening tag
   cleanContent = cleanContent.trim();
 
-  return { content: cleanContent, rawContent: content, model, usage, finishReason, truncated, ttftMs, generationMs };
+  // Safety net on top of the thinking-model max_tokens inflation: some MLX/GGUF
+  // quants still exhaust their budget inside an unclosed <think> block despite
+  // `enable_thinking:false` and the 4× inflation. If stripping leaves nothing but
+  // raw output exists, return the raw reasoning so the caller sees *something*
+  // rather than an empty body + lone footer (issue #6).
+  let thinkStripFallback = false;
+  if (!cleanContent && content.trim()) {
+    thinkStripFallback = true;
+    cleanContent = content.trim();
+  }
+
+  return { content: cleanContent, rawContent: content, model, usage, finishReason, truncated, ttftMs, generationMs, thinkStripFallback };
 }
 
 /**
@@ -769,6 +784,7 @@ interface QualitySignal {
   truncated: boolean;
   finishReason: string;
   thinkBlocksStripped: boolean;
+  thinkStripFallback: boolean;  // strip emptied content; returning raw as fallback
   estimatedTokens: boolean;   // true when usage was missing and we estimated
   contentLength: number;
   generationMs: number;
@@ -786,6 +802,7 @@ function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal
     truncated: resp.truncated,
     finishReason: resp.finishReason || 'unknown',
     thinkBlocksStripped: hadThinkBlocks,
+    thinkStripFallback: resp.thinkStripFallback ?? false,
     estimatedTokens: estimated,
     contentLength: resp.content.length,
     generationMs: resp.generationMs,
@@ -796,7 +813,8 @@ function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal
 function formatQualityLine(quality: QualitySignal): string {
   const flags: string[] = [];
   if (quality.truncated) flags.push('TRUNCATED');
-  if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
+  if (quality.thinkStripFallback) flags.push('think-strip-empty (showing raw reasoning — model ignored enable_thinking:false)');
+  else if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
   if (quality.estimatedTokens) flags.push('tokens-estimated');
   if (quality.finishReason === 'length') flags.push('hit-max-tokens');
   if (flags.length === 0) return '';
@@ -993,6 +1011,45 @@ const TOOLS = [
     },
   },
   {
+    name: 'code_task_files',
+    description:
+      'Like code_task, but the local LLM reads the files directly from disk — the contents never pass through the MCP client\'s context window.\n\n' +
+      'USE THIS instead of code_task when you want the LLM to review multiple files or a single large file, without copying source into the chat.\n\n' +
+      'HOW IT WORKS:\n' +
+      '• Provide absolute paths to the files you want analysed.\n' +
+      '• The server reads each file (Promise.allSettled — one unreadable file does not sink the call).\n' +
+      '• Files are concatenated with `=== <filename> ===` headers, then sent to the same code-review pipeline as code_task.\n' +
+      '• Read failures are surfaced inline (with the reason) so the LLM can still reason about what it did receive.\n\n' +
+      'WHEN TO USE:\n' +
+      '• Reviewing multiple related files (module + its tests, client + server pair)\n' +
+      '• Auditing a single large file too big to paste comfortably\n' +
+      '• Any code_task where saving MCP client tokens matters\n\n' +
+      'QA: Same rules as code_task — verify the output before acting on it.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Absolute file paths to analyse. Relative paths are rejected — always pass absolute.',
+        },
+        task: {
+          type: 'string',
+          description: 'What to do: "Find bugs", "Explain this module", "Suggest a cleaner API", etc.',
+        },
+        language: {
+          type: 'string',
+          description: 'Optional language hint: "typescript", "python", etc. Shapes the system prompt.',
+        },
+        max_tokens: {
+          type: 'number',
+          description: 'Optional output budget override. Defaults to 25% of the loaded model\'s context window.',
+        },
+      },
+      required: ['paths', 'task'],
+    },
+  },
+  {
     name: 'discover',
     description:
       'Check whether the local LLM is online and what model is loaded. Returns model name, context window size, ' +
@@ -1036,7 +1093,7 @@ const TOOLS = [
 // ── MCP Server ───────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.8.0' },
+  { name: 'houtini-lm', version: '2.9.0' },
   { capabilities: { tools: {}, resources: {} } },
 );
 
@@ -1216,6 +1273,92 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
       }
 
+      case 'code_task_files': {
+        const { paths, task, language, max_tokens: codeMaxTokens } = args as {
+          paths: string[];
+          task: string;
+          language?: string;
+          max_tokens?: number;
+        };
+
+        if (!Array.isArray(paths) || paths.length === 0) {
+          return {
+            content: [{ type: 'text', text: 'Error: paths must be a non-empty array of absolute file paths.' }],
+            isError: true,
+          };
+        }
+
+        // Reject relative paths early — silent resolution against cwd is surprising.
+        const relative = paths.filter((p) => typeof p !== 'string' || !isAbsolute(p));
+        if (relative.length > 0) {
+          return {
+            content: [{ type: 'text', text: `Error: all paths must be absolute. Relative paths: ${JSON.stringify(relative)}` }],
+            isError: true,
+          };
+        }
+
+        // Read all files in parallel. One unreadable file doesn't sink the call —
+        // failures become inline error sections so the model can still reason about
+        // the rest of the bundle.
+        const reads = await Promise.allSettled(
+          paths.map(async (p) => ({ path: p, content: await readFile(p, 'utf8') })),
+        );
+
+        const sections: string[] = [];
+        let successCount = 0;
+        reads.forEach((r, i) => {
+          const p = paths[i];
+          if (r.status === 'fulfilled') {
+            successCount++;
+            sections.push(`=== ${basename(p)} (${p}) ===\n${r.value.content}`);
+          } else {
+            const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
+            sections.push(`=== ${basename(p)} (${p}) — READ FAILED ===\n[Could not read: ${reason}]`);
+          }
+        });
+
+        if (successCount === 0) {
+          return {
+            content: [{ type: 'text', text: `Error: none of the ${paths.length} file(s) could be read. Check the paths and permissions.\n\n${sections.join('\n\n')}` }],
+            isError: true,
+          };
+        }
+
+        const lang = language || 'unknown';
+        const route = await routeToModel('code');
+        const outputConstraint = route.hints.outputConstraint
+          ? ` ${route.hints.outputConstraint}`
+          : '';
+
+        const combined = sections.join('\n\n');
+        const codeMessages: ChatMessage[] = [
+          {
+            role: 'system',
+            content: `Expert ${lang} developer. Your task: ${task}\n\nThe user has provided ${paths.length} file(s), concatenated below with \`=== filename ===\` headers. Reference files by name in your output. Be specific — line numbers, function names, concrete fixes. Output your analysis as a markdown list.${outputConstraint}`,
+          },
+          {
+            role: 'user',
+            content: `\`\`\`${lang}\n${combined}\n\`\`\``,
+          },
+        ];
+
+        // Pass codeMaxTokens raw (not `?? DEFAULT_MAX_TOKENS`) so the 25%-of-context
+        // auto-derivation in chatCompletionStreamingInner fires when the caller omits it.
+        const codeResp = await chatCompletionStreaming(codeMessages, {
+          temperature: route.hints.codeTemp,
+          maxTokens: codeMaxTokens,
+          model: route.modelId,
+          progressToken,
+        });
+
+        const readSummary = successCount === paths.length
+          ? `${paths.length} file(s) read`
+          : `${successCount}/${paths.length} file(s) read`;
+        const codeFooter = formatFooter(codeResp, `${lang} · ${readSummary}`);
+        const suggestionLine = route.suggestion ? `\n${route.suggestion}` : '';
+        return { content: [{ type: 'text', text: codeResp.content + codeFooter + suggestionLine }] };
+      }
+
       case 'discover': {
         const start = Date.now();
         let models: ModelInfo[];
@@ -1293,7 +1436,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         text += `${sessionStats}\n\n`;
-        text += `The local LLM is available. You can delegate tasks using chat, custom_prompt, code_task, or embed.`;
+        text += `The local LLM is available. You can delegate tasks using chat, custom_prompt, code_task, code_task_files, or embed.`;
 
         return { content: [{ type: 'text', text }] };
       }

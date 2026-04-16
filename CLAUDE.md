@@ -5,7 +5,7 @@ MCP server that connects Claude Code to any OpenAI-compatible LLM endpoint (LM S
 ## Project Structure
 
 ```
-src/index.ts        Main server — tools, streaming, model routing, session tracking (1154 lines)
+src/index.ts        Main server — tools, streaming, model routing, session tracking
 src/model-cache.ts  SQLite-backed model profile cache via sql.js/WASM, HuggingFace enrichment
 server.json         MCP registry manifest
 test.mjs            Integration tests (hits live LLM server, not mocked)
@@ -28,8 +28,10 @@ Tests require a live LLM endpoint. If hopper is available, run: `LM_STUDIO_URL=h
 ## Architecture
 
 - **Single server process** using `@modelcontextprotocol/sdk` with stdio transport
-- **6 tools:** `chat`, `custom_prompt`, `code_task`, `embed`, `discover`, `list_models`
-- **SSE streaming** for all inference — 55s soft timeout beats MCP SDK's ~60s hard limit
+- **7 tools:** `chat`, `custom_prompt`, `code_task`, `code_task_files`, `embed`, `discover`, `list_models`
+- **SSE streaming** for all inference. Soft timeout is 5 min — progress notifications (sent per chunk, including during the thinking phase) reset the MCP client's 60s clock, so the soft timeout is a safety net rather than the primary limit
+- **Dynamic `max_tokens`** — when the caller omits `max_tokens`, `chatCompletionStreamingInner` derives it as 25% of the active model's loaded context window. Falls back to `DEFAULT_MAX_TOKENS` (16384) when context is unknown
+- **Thinking-model handling** — when `getThinkingSupport()` reports a model supports the thinking toggle: (1) request body sets `enable_thinking: false`, (2) `max_tokens` is inflated to `max(requested × 4, requested + 2000)` so reasoning doesn't starve content generation (Gemma 4 hardcodes `enable_thinking=true` in its Jinja template and ignores the API flag, so the inflation is the real fix), (3) if strip still empties the response, we return raw content and flag `think-strip-empty` as a final safety net
 - **Model routing** scores loaded models by task type (code/chat/analysis/embedding)
 - **Per-family prompt hints** in `model-cache.ts` (`PROMPT_HINTS` array) — temperature, output constraints, think-block flags
 - **Static model profiles** in `index.ts` (`MODEL_PROFILES` array) — curated descriptions for known families
@@ -49,7 +51,7 @@ Tests require a live LLM endpoint. If hopper is available, run: `LM_STUDIO_URL=h
 ## Gotchas
 
 - **stdout is sacred:** Any `console.log()` will corrupt the MCP stdio transport. Use `process.stderr.write()` for all debug/log output.
-- **Version in three places:** `package.json`, `server.json`, and `new Server()` call in `index.ts` (~line 857) must stay in sync.
+- **Version in three places:** `package.json`, `server.json`, and the `new Server()` call in `index.ts` must stay in sync — grep for the current version to find them.
 - **Windows commit messages:** Use HEREDOC syntax for multi-line git commit messages (cmd.exe doesn't handle single quotes in `-m` well).
 - **Model loading is slow:** Never attempt to JIT-load models — it takes minutes and MCP has a ~60s timeout. The routing layer suggests better models instead.
 - **sql.js is WASM:** Zero native deps intentionally — no node-gyp, works everywhere. Don't swap for better-sqlite3.
