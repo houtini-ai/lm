@@ -2,7 +2,6 @@
 
 [![npm version](https://img.shields.io/npm/v/@houtini/lm.svg?style=flat-square)](https://www.npmjs.com/package/@houtini/lm)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
-[![Known Vulnerabilities](https://snyk.io/test/github/houtini-ai/lm/badge.svg)](https://snyk.io/test/github/houtini-ai/lm)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 <p align="center">
@@ -13,7 +12,7 @@
 
 > **Quick Navigation**
 >
-> [How it works](#how-it-works) | [Token savings](#token-savings--benchmarked) | [Quick start](#quick-start) | [What gets offloaded](#what-gets-offloaded) | [Tools](#tools) | [Model routing](#model-routing) | [Configuration](#configuration) | [Compatible endpoints](#compatible-endpoints)
+> [How it works](#how-it-works) | [Quick start](#quick-start) | [What gets offloaded](#what-gets-offloaded) | [Tools](#tools) | [Model routing](#model-routing) | [Configuration](#configuration) | [Compatible endpoints](#compatible-endpoints)
 
 I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need Claude's reasoning or tool access.
 
@@ -38,29 +37,6 @@ Claude Code (orchestrator)
 ```
 
 Claude's the architect. Your local model's the drafter. Claude QAs everything.
-
-## Token savings — benchmarked
-
-We built a benchmark using real source files (581–2022 lines of TypeScript) across realistic delegation patterns. The savings come from **context avoidance** — when Claude delegates, it never reads the source file into its context window.
-
-<p align="center">
-  <img src="docs/token-savings-chart.svg" alt="Token savings benchmark chart showing 86-95% savings across code review, architecture review, and code explanation tasks" />
-</p>
-
-| Task | Claude direct | Delegated | Saved |
-|------|--------------|-----------|-------|
-| Code review (1352 lines) | 14,466 tok | 769 tok | **95%** |
-| Architecture review (2022 lines) | 20,014 tok | 983 tok | **95%** |
-| External repo review (581 lines) | 5,344 tok | 741 tok | **86%** |
-| Code explanation (833 lines) | 8,678 tok | 744 tok | **91%** |
-
-**93.3% net token savings** across the session. Without delegation, Claude reads 14,000 tokens of source code then generates a 500-token review. With delegation, Claude sends a ~250 token tool call and reads back a ~500 token summary. The source file never enters Claude's context.
-
-Small tasks (quick answers, commit messages) don't save tokens — the ~250 token MCP overhead dominates. But for anything involving reading and analysing files, which is the majority of real coding sessions, delegation pays for itself immediately.
-
-Run the benchmark against your own setup: `LM_STUDIO_URL=http://your-server:1234 node benchmark.mjs`
-
-Every response comes back with performance stats - TTFT, tokens per second, generation time - so you can actually see what your local hardware is doing. The session footer tracks cumulative offloaded tokens across every call. Every response also includes quality signals - truncation detection, think-block stripping flags, token estimation accuracy - so Claude can make informed trust decisions about the output.
 
 ## Quick start
 
