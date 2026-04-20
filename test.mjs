@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 /**
- * Test suite for houtini-lm MCP server
- * Tests the underlying OpenAI-compatible API on hopper:1234
+ * Test suite for houtini-lm MCP server.
+ *
+ * Integration tests — hits a live OpenAI-compatible endpoint.
+ * Point LM_STUDIO_URL at whichever server is running (defaults to
+ * http://localhost:1234). The loaded model is auto-detected when
+ * LM_STUDIO_MODEL is not set.
  */
 
 const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';

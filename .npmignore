@@ -1,71 +1,47 @@
-# Source files (dist/ contains compiled version)
+# Source — dist/ holds the compiled output that ships
 src/
-tests/
-diagnostics/
-scripts/
-test-files/
-
-# CRITICAL: Protect proprietary template system
-src/templates/
-templates/
-src/templates/plugin-template.ts
-
-# Development files
-.env*
-*.log
-.vscode/
-.idea/
 tsconfig.json
-jest.config.js
-.eslintrc.*
-add-shebang.js
+add-shebang.mjs
 
-# Git and GitHub development files
+# Test and benchmark scripts (not part of the published package)
+test.mjs
+benchmark.mjs
+
+# Developer docs — keep README.md, CHANGELOG.md, and LICENSE (auto-included)
+*.md
+!README.md
+!CHANGELOG.md
+
+# Git / GitHub
 .git/
 .github/
 .gitignore
 
-# Node modules and locks
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-package-lock.json
-
-# Coverage and test outputs
-coverage/
-.nyc_output/
-*.test.*
-*.spec.*
-
-# Documentation source (keep README.md and CHANGELOG.md)
-docs/
-examples/
-*.md
-!README.md
-!CHANGELOG.md
-!LICENSE
-
-# Build artifacts and temporary files
-*.tgz
-*.tar.gz
-build/
-lib/
-temp/
-tmp/
-
-# OS and IDE files
-.DS_Store
-Thumbs.db
+# Editor / OS
 .vscode/
 .idea/
+.claude/
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
 *~
 
-# TypeScript build configs
-tsconfig.*.json
-
-# Development utilities
-diagnostic/
+# Build noise
+*.tsbuildinfo
+*.log
+*.tgz
 *.map
+coverage/
+.nyc_output/
+
+# Env / credentials
+.env
+.env.*
+
+# Docs tree and media (not shipped)
+docs/
+houtini-logo.png
+
+# Stray Windows artefacts
+nul
