@@ -78,7 +78,21 @@ function recordUsage(resp: StreamingResult) {
 function sessionSummary(): string {
   const total = session.promptTokens + session.completionTokens;
   if (session.calls === 0) return '';
-  return `Session: ${total.toLocaleString()} tokens offloaded across ${session.calls} call${session.calls === 1 ? '' : 's'}`;
+  const callWord = session.calls === 1 ? 'call' : 'calls';
+  return `💰 Claude quota saved this session: ${total.toLocaleString()} tokens across ${session.calls} offloaded ${callWord}`;
+}
+
+/**
+ * Return true when this response is the first one with measurable perf stats
+ * for its model in the current session. Used to surface a one-off "benchmarked"
+ * line so Claude sees the real speed of the local model on a genuine task,
+ * not an artificial warmup.
+ */
+function isFirstBenchmarkedCall(modelId: string, tokPerSec: number): boolean {
+  if (!modelId || tokPerSec <= 0) return false;
+  const stats = session.modelStats.get(modelId);
+  // After recordUsage has run, perfCalls === 1 means this was the first measured call.
+  return !!stats && stats.perfCalls === 1;
 }
 
 function apiHeaders(): Record<string, string> {
@@ -631,8 +645,17 @@ async function chatCompletionStreamingInner(
       }
     }
   } finally {
-    // Release the reader — don't await cancel() as it can hang
-    reader.releaseLock();
+    // Best-effort cancel with a short timeout — cancel() can hang if the upstream
+    // connection is wedged, so we race it against a 500ms timer. This frees the
+    // underlying socket sooner on abrupt client disconnects without blocking the
+    // tool response path.
+    try {
+      await Promise.race([
+        reader.cancel().catch(() => { /* ignore */ }),
+        new Promise<void>((resolve) => setTimeout(resolve, 500)),
+      ]);
+    } catch { /* never propagate cleanup errors */ }
+    try { reader.releaseLock(); } catch { /* already released */ }
   }
 
   const generationMs = Date.now() - startTime;
@@ -823,6 +846,12 @@ function formatQualityLine(quality: QualitySignal): string {
 
 /**
  * Format a footer line for streaming results showing model, usage, and truncation status.
+ *
+ * Layout:
+ *   ---
+ *   Model: ... | prompt→completion tokens | perf | extra | quality
+ *   📊 [first-call benchmark line, only on the first measured call per model]
+ *   💰 Claude quota saved this session: ...
  */
 function formatFooter(resp: StreamingResult, extra?: string): string {
   // Record usage for session tracking before formatting
@@ -841,8 +870,9 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   // Perf stats — computed from streaming, no proprietary API needed
   const perfParts: string[] = [];
   if (resp.ttftMs !== undefined) perfParts.push(`TTFT: ${resp.ttftMs}ms`);
+  let tokPerSec = 0;
   if (resp.usage && resp.generationMs > 50) {
-    const tokPerSec = resp.usage.completion_tokens / (resp.generationMs / 1000);
+    tokPerSec = resp.usage.completion_tokens / (resp.generationMs / 1000);
     perfParts.push(`${tokPerSec.toFixed(1)} tok/s`);
   }
   if (resp.generationMs) perfParts.push(`${(resp.generationMs / 1000).toFixed(1)}s`);
@@ -856,10 +886,23 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   if (qualityLine) parts.push(qualityLine);
   if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
 
-  const sessionLine = sessionSummary();
-  if (sessionLine) parts.push(sessionLine);
+  if (parts.length === 0) return '';
 
-  return parts.length > 0 ? `\n\n---\n${parts.join(' | ')}` : '';
+  const lines: string[] = [`\n\n---\n${parts.join(' | ')}`];
+
+  // First-call speed benchmark — surfaced once per model per session, based on
+  // the real task just completed (not a synthetic warmup). Gives Claude honest
+  // speed data to calibrate future delegation decisions.
+  if (isFirstBenchmarkedCall(resp.model, tokPerSec)) {
+    const ttftStr = resp.ttftMs !== undefined ? `, ${resp.ttftMs}ms to first token` : '';
+    lines.push(`📊 First measured call on ${resp.model}: ${tokPerSec.toFixed(1)} tok/s${ttftStr} — use this to gauge whether to delegate longer tasks.`);
+  }
+
+  // Session savings — on its own line so it reads as value, not as accounting.
+  const sessionLine = sessionSummary();
+  if (sessionLine) lines.push(sessionLine);
+
+  return lines.join('\n');
 }
 
 // ── MCP Tool definitions ─────────────────────────────────────────────
@@ -868,31 +911,22 @@ const TOOLS = [
   {
     name: 'chat',
     description:
-      'Send a task to a local LLM running on a separate machine. This is a FREE, parallel worker — ' +
-      'use it to offload bounded work while you continue doing other things. The local LLM runs independently ' +
-      'and does not consume your tokens or rate limits.\n\n' +
-      'PLANNING: When you start a large task (refactoring, migrations, test suites, documentation), ' +
-      'break it into steps and identify which ones are bounded grunt work you can delegate here. ' +
-      'The more you offload, the more tokens you save. The session footer tracks cumulative savings.\n\n' +
-      'WHEN TO USE (delegate generously — it costs nothing):\n' +
-      '• Explain or summarise code/docs you just read\n' +
+      'Send a task to a local LLM — a sidekick running on the user\'s hardware or a configured OpenAI-compatible endpoint. ' +
+      'It does not consume the user\'s Claude quota. Trades latency for tokens: local inference is typically 3-30× slower than frontier models, so delegation wins when the task is bounded and self-contained.\n\n' +
+      'Good fit:\n' +
+      '• Explain or summarise code/docs you already have in context\n' +
       '• Generate boilerplate, test stubs, type definitions, mock data\n' +
       '• Answer factual questions about languages, frameworks, APIs\n' +
       '• Draft commit messages, PR descriptions, comments\n' +
       '• Translate or reformat content (JSON↔YAML, snake_case↔camelCase)\n' +
-      '• Brainstorm approaches before you commit to one\n' +
-      '• Any self-contained subtask that does not need tool access\n\n' +
-      'PROMPT QUALITY (the local model is highly capable — results depend on your prompt):\n' +
-      '(1) Always send COMPLETE code/context — never truncate, the local LLM cannot access files.\n' +
+      '• Brainstorm approaches before committing to one\n\n' +
+      'Less good when: the task needs tool access, depends on multi-file context you have not captured, or is quick enough for you to answer directly before the round-trip completes.\n\n' +
+      'Prompt tips (local models take instructions literally):\n' +
+      '(1) Send COMPLETE context — the local LLM cannot read files.\n' +
       '(2) Be explicit about output format ("respond as a JSON array", "return only the function").\n' +
-      '(3) Set a specific persona in the system field — "Senior TypeScript dev" beats "helpful assistant".\n' +
-      '(4) State constraints: "no preamble", "reference line numbers", "max 5 bullet points".\n' +
-      '(5) For code generation, include the surrounding context (imports, types, function signatures).\n\n' +
-      'QA: Always review the local LLM\'s output before using it. Verify correctness, check edge cases, ' +
-      'and fix any issues. You are the architect — the local model is a fast drafter, not the final authority.\n\n' +
-      'ROUTING: If multiple models are loaded, houtini-lm automatically picks the best one for the task. ' +
-      'If a better model is downloaded but not loaded, you\'ll see a suggestion in the response footer. ' +
-      'Call discover to see what\'s available.',
+      '(3) Specific system persona beats generic — "Senior TypeScript dev" not "helpful assistant".\n' +
+      '(4) State constraints — "no preamble", "reference line numbers", "max 5 bullets".\n\n' +
+      'Routing picks the best loaded model automatically. Call `discover` to see what is loaded and, after the first real call, its measured speed. The footer shows cumulative tokens kept in the user\'s quota.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -924,20 +958,18 @@ const TOOLS = [
     name: 'custom_prompt',
     description:
       'Structured analysis via the local LLM with explicit system/context/instruction separation. ' +
-      'This 3-part format prevents context bleed and gets the best results from local models.\n\n' +
-      'USE THIS for complex tasks where prompt structure matters — it consistently outperforms ' +
-      'stuffing everything into a single message. The separation helps the local model focus.\n\n' +
-      'WHEN TO USE:\n' +
+      'The 3-part format prevents context bleed in smaller models — the local LLM acknowledges the context in a fake assistant turn before receiving the instruction.\n\n' +
+      'Good fit when prompt structure matters:\n' +
       '• Code review — paste full source, ask for bugs/improvements\n' +
       '• Comparison — paste two implementations, ask which is better and why\n' +
       '• Refactoring suggestions — paste code, ask for a cleaner version\n' +
       '• Content analysis — paste text, ask for structure/tone/issues\n' +
       '• Any task where separating context from instruction improves clarity\n\n' +
-      'PROMPT STRUCTURE (each field has a job — keep them focused):\n' +
-      '• System: persona + constraints, under 30 words. "Expert Python developer focused on performance and correctness."\n' +
-      '• Context: COMPLETE data. Full source code, full logs, full text. NEVER truncate or summarise.\n' +
-      '• Instruction: exactly what to produce, under 50 words. Specify format: "Return a JSON array of {line, issue, fix}."\n\n' +
-      'QA: Review the output. The local model is a capable drafter — verify its analysis before acting on it.',
+      'Field guidance (each has a job — keep them focused):\n' +
+      '• system: persona + constraints, under 30 words. "Expert Python developer focused on performance and correctness."\n' +
+      '• context: COMPLETE data — full source, full logs, full text. Never truncate.\n' +
+      '• instruction: exactly what to produce, under 50 words. Specify format: "Return a JSON array of {line, issue, fix}."\n\n' +
+      'Review the output before acting on it — local model capability varies.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -972,21 +1004,19 @@ const TOOLS = [
   {
     name: 'code_task',
     description:
-      'Send a code analysis task to the local LLM. Wraps the request with an optimised code-review system prompt.\n\n' +
-      'This is the fastest way to offload code-specific work. Temperature is locked to 0.2 for ' +
-      'focused, deterministic output. The system prompt is pre-configured for code review.\n\n' +
-      'WHEN TO USE:\n' +
+      'Send a code-specific task to the local LLM, wrapped with an optimised code-review system prompt. Temperature is locked low (0.2 or the routed model\'s hint) for deterministic output.\n\n' +
+      'Good fit:\n' +
       '• Explain what a function/class does\n' +
       '• Find bugs or suggest improvements\n' +
       '• Generate unit tests or type definitions for existing code\n' +
       '• Add error handling, logging, or validation\n' +
       '• Convert between languages or patterns\n\n' +
-      'GETTING BEST RESULTS:\n' +
-      '• Provide COMPLETE source code — the local LLM cannot read files.\n' +
+      'For best results:\n' +
+      '• Provide COMPLETE source — the local LLM cannot read files.\n' +
       '• Include imports and type definitions so the model has full context.\n' +
-      '• Be specific in the task: "Write 3 Jest tests for the error paths in fetchUser" beats "Write tests".\n' +
+      '• Be specific: "Write 3 Jest tests for the error paths in fetchUser" beats "Write tests".\n' +
       '• Set the language field — it shapes the system prompt and improves accuracy.\n\n' +
-      'QA: Always verify generated code compiles, handles edge cases, and follows project conventions.',
+      'Verify generated code compiles, handles edge cases, and follows project conventions before committing.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1013,18 +1043,17 @@ const TOOLS = [
   {
     name: 'code_task_files',
     description:
-      'Like code_task, but the local LLM reads the files directly from disk — the contents never pass through the MCP client\'s context window.\n\n' +
-      'USE THIS instead of code_task when you want the LLM to review multiple files or a single large file, without copying source into the chat.\n\n' +
-      'HOW IT WORKS:\n' +
-      '• Provide absolute paths to the files you want analysed.\n' +
-      '• The server reads each file (Promise.allSettled — one unreadable file does not sink the call).\n' +
-      '• Files are concatenated with `=== <filename> ===` headers, then sent to the same code-review pipeline as code_task.\n' +
-      '• Read failures are surfaced inline (with the reason) so the LLM can still reason about what it did receive.\n\n' +
-      'WHEN TO USE:\n' +
-      '• Reviewing multiple related files (module + its tests, client + server pair)\n' +
+      'Like code_task, but the local LLM reads files directly from disk — source never passes through the MCP client\'s context window. Use when reviewing multiple files or a single large file.\n\n' +
+      'How it works:\n' +
+      '• Provide absolute paths. Relative paths are rejected.\n' +
+      '• Files are read in parallel (Promise.allSettled) — one unreadable file does not sink the call.\n' +
+      '• Files are concatenated with `=== filename ===` headers and sent to the same code-review pipeline as code_task.\n' +
+      '• Read failures are surfaced inline with the reason so the LLM can still reason about the rest.\n\n' +
+      'Good fit:\n' +
+      '• Reviewing related files together (module + its tests, client + server pair)\n' +
       '• Auditing a single large file too big to paste comfortably\n' +
-      '• Any code_task where saving MCP client tokens matters\n\n' +
-      'QA: Same rules as code_task — verify the output before acting on it.',
+      '• Any code_task where keeping source out of the Claude context window matters\n\n' +
+      'Same review discipline as code_task — verify the output before acting on it.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1092,9 +1121,18 @@ const TOOLS = [
 
 // ── MCP Server ───────────────────────────────────────────────────────
 
+// Session-level sidekick framing. MCP clients surface this to the model
+// at initialisation, so it sets the baseline expectation for when to delegate
+// rather than relying on per-tool descriptions being re-read on every call.
+const SIDEKICK_INSTRUCTIONS =
+  `Houtini-lm is a local LLM sidekick. It runs on the user's hardware (or a configured OpenAI-compatible endpoint) and handles bounded work without consuming the user's Claude quota.\n\n` +
+  `When to reach for it: bounded, self-contained tasks you can describe in one message — explanations, boilerplate, test stubs, code review of pasted or file-loaded source, translations, commit messages, format conversion, brainstorming. Trades wall-clock time for tokens (typically 3-30× slower than frontier models).\n\n` +
+  `When not to: tasks that need tool access, cross-file reasoning you haven't captured, or work fast enough to answer directly before the delegation round-trip completes.\n\n` +
+  `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
+
 const server = new Server(
-  { name: 'houtini-lm', version: '2.9.0' },
-  { capabilities: { tools: {}, resources: {} } },
+  { name: 'houtini-lm', version: '2.10.0' },
+  { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 
 // ── MCP Resources ─────────────────────────────────────────────────────
@@ -1394,16 +1432,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const ctx = getContextLength(primary);
         const primaryProfile = await getModelProfileAsync(primary);
 
+        const totalOffloaded = session.promptTokens + session.completionTokens;
         const sessionStats = session.calls > 0
-          ? `\nSession stats: ${(session.promptTokens + session.completionTokens).toLocaleString()} tokens offloaded across ${session.calls} call${session.calls === 1 ? '' : 's'}`
-          : '\nSession stats: no calls yet — delegate tasks to start saving tokens';
+          ? `\n💰 Claude quota saved this session: ${totalOffloaded.toLocaleString()} tokens across ${session.calls} offloaded call${session.calls === 1 ? '' : 's'}`
+          : `\n💰 Claude quota saved this session: 0 tokens — no calls yet. Measured speed for each model will appear here after the first real call.`;
+
+        // Measured speed line for the active model. Discover intentionally does
+        // not run a synthetic warmup — speed is captured from real tasks, so the
+        // numbers reflect actual workload rather than a contrived benchmark.
+        const primaryStats = session.modelStats.get(primary.id);
+        let speedLine = '';
+        if (primaryStats && primaryStats.perfCalls > 0) {
+          const avgTtft = primaryStats.calls > 0 ? Math.round(primaryStats.totalTtftMs / primaryStats.calls) : 0;
+          const avgTokSec = (primaryStats.totalTokPerSec / primaryStats.perfCalls).toFixed(1);
+          speedLine = `Measured speed: ${avgTokSec} tok/s · TTFT ${avgTtft}ms (avg over ${primaryStats.perfCalls} call${primaryStats.perfCalls === 1 ? '' : 's'} this session)\n`;
+        } else {
+          speedLine = `Measured speed: not yet benchmarked — will be captured on the first real call.\n`;
+        }
 
         let text =
           `Status: ONLINE\n` +
           `Endpoint: ${LM_BASE_URL}\n` +
-          `Latency: ${ms}ms\n` +
+          `Connection latency: ${ms}ms (does not reflect inference speed)\n` +
           `Active model: ${primary.id}\n` +
-          `Context window: ${ctx.toLocaleString()} tokens\n`;
+          `Context window: ${ctx.toLocaleString()} tokens\n` +
+          speedLine;
 
         if (primaryProfile) {
           text += `Family: ${primaryProfile.family}\n`;

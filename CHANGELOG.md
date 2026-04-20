@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.10.0] - 2026-04-20
+
+### Changed
+- **Tool descriptions reframed from pitch to peer** — removed "FREE, parallel worker", "delegate generously — it costs nothing", and similar salesy framing from `chat`, `custom_prompt`, `code_task`, and `code_task_files`. Descriptions now state the honest trade (local inference is typically 3-30× slower than frontier models, but doesn't bill against the user's Claude quota) and let the caller decide task-by-task. Positions houtini-lm as a sidekick — a capable peer for bounded work — rather than a blanket offload target.
+- **Session savings line promoted** — the cumulative offloaded-token line now appears on its own line below the response footer with a 💰 prefix and "Claude quota saved this session" framing, instead of being pipe-separated among six other fields. Reads as value rather than accounting.
+- **`discover` connection latency relabelled** — the ms number in discover is now labelled "Connection latency (does not reflect inference speed)" to avoid the prior misreading that it measured how fast the model generates tokens.
+
+### Added
+- **Session-level sidekick instructions** — the MCP `Server` now sends an `instructions` string at initialisation that frames houtini-lm as a local LLM sidekick, states when to delegate vs when not to, and directs Claude to `discover` for model speed. Surfaced once per session by the MCP client, so it sets baseline expectations rather than relying on per-tool descriptions being re-read.
+- **First-call speed benchmark** — on the first measured call per model per session, the response footer adds a prominent line (`📊 First measured call on <model>: X tok/s, Yms to first token`). No synthetic warmup — the number reflects a real task. Gives Claude honest speed data for calibrating subsequent delegation decisions.
+- **`discover` surfaces measured speed** — the active model's measured tok/s and TTFT appear prominently near the top of the discover output, averaged over the session. Shows "not yet benchmarked" when no real call has run, rather than inventing a number from an artificial probe.
+
+### Fixed
+- **Streaming reader cleanup on abrupt disconnect** — the `finally` block now races `reader.cancel()` against a 500ms timer before `releaseLock()`, so abrupt client disconnects free the upstream socket sooner without blocking the tool response path. Previously `releaseLock()` alone could leave a wedged upstream connection until the per-chunk timeout fired.
+
 ## [2.9.0] - 2026-04-16
 
 ### Added
