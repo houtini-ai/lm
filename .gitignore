@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .claude/
+memory/
+MEMORY.md
 .env
 .env.*
 *.log

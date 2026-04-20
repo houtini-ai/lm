@@ -1,5 +1,35 @@
 # Changelog
 
+## [2.11.0] - 2026-04-20
+
+### Added
+- **`stats` MCP tool** — compact markdown dump of session + lifetime totals, per-model performance, and reasoning-token overhead. Optional `model` filter. Cheap to call repeatedly to watch the 💰 counter climb.
+- **Lifetime performance persistence** — a new `model_performance` SQLite table accumulates calls, TTFT, tok/s, prompt tokens, completion tokens, and reasoning tokens across sessions. Footer now reads `this session: X · lifetime: Y`. `discover` shows both session and lifetime speed lines, with a `last used` date. Data lives in `~/.houtini-lm/model-cache.db` alongside the existing profile cache.
+- **Backend detection** — startup probe distinguishes LM Studio (`/api/v0/models`), Ollama (`/api/tags`), and generic OpenAI-compatible (`/v1/models`). Surfaced in `discover` output. Inference stays on the portable `/v1/chat/completions` path regardless — detection only steers enrichment and the per-backend `reasoning_effort` mapping.
+- **`delta.reasoning_content` capture** — LM Studio's "Separate reasoning_content" dev toggle, DeepSeek R1, and Nemotron stream reasoning via this vendor-extension field. Previously discarded → silent empty bodies when the model exhausted its output budget on reasoning. Now captured into a buffer and returned as a last-ditch fallback with a `reasoning-only` quality flag so the caller sees *something*.
+- **Prefill keep-alive** — a timer fires `notifications/progress` every 10s while waiting for the first chunk, preventing the MCP client's ~60s request timeout from firing during long prompt processing on slow hardware with big inputs.
+- **Split prefill vs mid-stream timeouts** — `PREFILL_TIMEOUT_MS` (180s) applies until the first chunk arrives; `READ_CHUNK_TIMEOUT_MS` (30s) takes over afterwards. New `PREFILL-STALL` quality flag when truncation happens before any chunk.
+- **Pre-flight token estimator for `code_task_files`** — uses measured per-model prefill rate from SQLite to refuse obviously-over-budget inputs early with a concrete diagnostic (estimated prefill seconds, tokens, sample count) instead of letting them silently hang. Only fires after ≥2 measured samples — first-time callers are never refused.
+- **Reasoning-token split in footer** — when `usage.completion_tokens_details.reasoning_tokens` arrives, the token block reads `prompt→total (reasoning / visible)`. Diagnoses "why is the body empty despite hit-max-tokens?" instantly.
+- **`reasoning_effort` + `max_completion_tokens` in request body** — sent alongside `enable_thinking: false` and `max_tokens` for broader compatibility. `reasoning_effort` value is backend-mapped: `'none'` on LM Studio + Ollama (hardest off-switch), `'low'` on generic OpenAI-compatible.
+- **`shakedown.mjs` end-to-end self-test** — runs all seven tools in sequence, prints a markdown summary with real TTFT / tok/s / token counts / reasoning-token split. Wired as `npm run shakedown`. Not shipped in the npm tarball.
+- **`SHAKEDOWN.md`** — canonical natural-language test prompt for conversational test runs via Claude.
+- **`DEVELOPER.md`** — internals guide: streaming pipeline, reasoning-model handling, backend detection, SQLite schema, pre-flight estimator, adding tools/backends, release process, quality-flag reference.
+
+### Fixed
+- **`reasoning_effort: 'low'` caused HTTP 400 on Nemotron via LM Studio** — the LM Studio adapter accepts `none | minimal | low | medium | high | xhigh`, and Nemotron's narrower set would reject `'low'` with a silent fallback to `'on'` (maximum reasoning — opposite of intent). Backend-mapped value (`'none'` on LM Studio) is accepted by every model variant and is the hardest off-switch available.
+- **Silent empty bodies on reasoning models** (Nemotron, DeepSeek R1, LM Studio with "Separate reasoning_content") — previously `delta.reasoning_content` was tracked for progress notifications but never accumulated into a content buffer, so when the model exhausted `max_tokens` on reasoning before emitting any `delta.content`, the response was empty and no safety flag fired. Now captured and returned via `reasoningFallback` with a clear preamble and flag.
+- **Thinking-model detection was Gemma-4-only** — now covers Nemotron, DeepSeek R1, GLM-4, gpt-oss, and `qwen3-thinking` / `*-thinking` patterns. Arch + id + HF chat_template signals are OR'd.
+- **Stale cache masked new thinking detection** — `getThinkingSupport` now re-applies the arch/id fallback at read time, so entries cached before the detection list was broadened still pick up flags without a manual cache flush.
+- **`max_tokens` inflation used wrong base** — was `DEFAULT_MAX_TOKENS` (16k), now `effectiveMaxTokens` (context-aware 25%), so inflation sizes correctly on big-context models.
+- **README `code_task_files` parameter name** — was documented as `file_paths`, actual parameter is `paths`.
+
+### Changed
+- **Footer format updated** to show `this session: X · lifetime: Y` and `tokens (reasoning / visible)` splits where applicable.
+- **`discover` per-model speed line** now shows session and/or lifetime variants; the "not yet benchmarked" fallback only appears for models with no prior use on the workstation.
+- **`code_task_files` tool description** mentions the size ceiling and pre-flight estimator behaviour.
+- **`.gitignore` / `.npmignore`** add explicit `memory/` and `MEMORY.md` entries.
+
 ## [2.10.0] - 2026-04-20
 
 ### Changed

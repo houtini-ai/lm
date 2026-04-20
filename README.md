@@ -12,7 +12,7 @@
 
 > **Quick Navigation**
 >
-> [How it works](#how-it-works) | [Quick start](#quick-start) | [What gets offloaded](#what-gets-offloaded) | [Tools](#tools) | [Model routing](#model-routing) | [Configuration](#configuration) | [Compatible endpoints](#compatible-endpoints)
+> [How it works](#how-it-works) | [Quick start](#quick-start) | [What gets offloaded](#what-gets-offloaded) | [Tools](#tools) | [Performance tracking](#performance-tracking) | [Structured JSON output](#structured-json-output) | [Model routing](#model-routing) | [Self-test (shakedown)](#self-test-shakedown) | [Configuration](#configuration) | [Compatible endpoints](#compatible-endpoints) | [Developer guide](./DEVELOPER.md)
 
 I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need Claude's reasoning or tool access.
 
@@ -144,23 +144,34 @@ The tool descriptions are written to nudge Claude into planning delegation at th
 
 ## Performance tracking
 
-Every response includes a footer with real performance data - computed from the SSE stream, not from any proprietary API:
+Every response includes a footer with real performance data — computed from the SSE stream, not from any proprietary API:
 
 ```
 ---
-Model: zai-org/glm-4.7-flash | 125->430 tokens | TTFT: 678ms, 48.7 tok/s, 12.5s
-📊 First measured call on zai-org/glm-4.7-flash: 48.7 tok/s, 678ms to first token — use this to gauge whether to delegate longer tasks.
-💰 Claude quota saved this session: 8,450 tokens across 14 offloaded calls
+Model: nvidia/nemotron-3-nano | 279→303 tokens (12 reasoning / 291 visible) | TTFT: 485ms, 58.0 tok/s, 5.2s
+📊 First measured call on nvidia/nemotron-3-nano: 58.0 tok/s, 485ms to first token — use this to gauge whether to delegate longer tasks.
+💰 Claude quota saved — this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
 ```
 
 The 📊 line only appears on the first measured call per model per session — it's a real benchmark from a genuine task, not a synthetic warmup. The 💰 line updates every call.
 
-The `discover` tool shows per-model averages across the session:
+When the active model returns `completion_tokens_details.reasoning_tokens` (DeepSeek R1, LM Studio with "Separate reasoning_content" enabled, OpenAI reasoning models), the token block splits into `reasoning / visible` so you can see when a thinking model is burning its output budget on hidden reasoning.
+
+### Lifetime persistence
+
+Per-model performance and token counts persist across Claude Desktop restarts in `~/.houtini-lm/model-cache.db`. This means:
+
+- From call 1 of a new session, `discover` shows **historical** tok/s and TTFT for the loaded model — not "not yet benchmarked".
+- The 💰 counter shows both session and lifetime totals.
+- The `code_task_files` pre-flight estimator uses measured per-model prefill rate to refuse obviously-too-large inputs with a clear diagnostic, instead of letting them silently hang against the MCP client timeout.
+
+The data is workstation-specific — that's intentional. Routing decisions should reflect your actual hardware, not a synthetic benchmark.
+
+The `discover` tool shows per-model averages across both scopes:
 
 ```
-Performance (this session):
-  nvidia/nemotron-3-nano: 6 calls, avg TTFT 234ms, avg 45.2 tok/s
-  zai-org/glm-4.7-flash: 8 calls, avg TTFT 678ms, avg 48.7 tok/s
+Measured speed (session):  58.0 tok/s · TTFT 485ms (1 call)
+Measured speed (lifetime on this workstation): 46.9 tok/s · TTFT 2641ms (214 calls, last used 2026-04-20)
 ```
 
 In practice, Claude delegates more aggressively the longer a session runs. After about 5,000 offloaded tokens, it starts hunting for more work to push over. Reinforcing loop.
@@ -215,9 +226,11 @@ Built for code analysis. Pre-configured system prompt with temperature and outpu
 
 Like `code_task`, but the local LLM reads files directly from disk — source never passes through the MCP client's context window. Use this when reviewing multiple related files, or a single large file that's awkward to paste. Files are read in parallel with `Promise.allSettled`, so one unreadable file doesn't sink the call; failures are surfaced inline with the reason.
 
+Includes a **pre-flight prefill estimator**: if measured per-model data from the SQLite cache shows the input would exceed the MCP client's ~60s request-timeout during prompt processing, the call is refused early with a concrete diagnostic (estimated prefill seconds, tokens, and sample-count) instead of letting it silently hang. First-time callers are never refused — the estimator only fires after ≥2 measured samples.
+
 | Parameter | Required | Default | What it does |
 |-----------|----------|---------|-------------|
-| `file_paths` | yes | - | Array of absolute paths. Relative paths are rejected. |
+| `paths` | yes | - | Array of absolute file paths. Relative paths are rejected. |
 | `task` | yes | - | "Find bugs across these files", "Audit this module" |
 | `language` | no | - | "typescript", "python", "rust", etc. |
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
@@ -238,6 +251,37 @@ Health check and speed readout. Returns model name, context window, capability p
 ### `list_models`
 
 Lists everything on the LLM server - loaded and downloaded - with full metadata: architecture, quantisation, context window, capabilities, and HuggingFace enrichment data. Shows capability profiles describing what each model is best at, so Claude can make informed delegation decisions.
+
+### `stats`
+
+Compact markdown dump of your offload stats — session and lifetime totals, per-model performance history, reasoning-token overhead — without the model catalog that `discover` prints. Cheap to call repeatedly to watch the 💰 counter climb.
+
+| Parameter | Required | Default | What it does |
+|-----------|----------|---------|-------------|
+| `model` | no | - | Filter output to a single model ID. Omit for all models ever used on this workstation. |
+
+Example output:
+
+```
+## Houtini LM stats
+**Endpoint**: http://hopper:1234 (LM Studio)
+**First call on this workstation**: 2026-04-14
+
+### Totals
+| Scope    | Calls | Prompt tokens | Completion tokens | Total tokens |
+| Session  |     7 |         3,100 |             1,183 |        4,283 |
+| Lifetime |   213 |             — |                 — |      147,432 |
+
+### Per-model performance
+| Model                    | Scope    | Calls | Avg TTFT | Avg tok/s | Prompt tokens | Last used  |
+| nvidia/nemotron-3-nano   | session  |     7 |    485   |      58.0 | —             | —          |
+| nvidia/nemotron-3-nano   | lifetime |   213 |   2641   |      46.9 |       89,320  | 2026-04-20 |
+
+### Reasoning-token overhead (lifetime)
+124 / 47,183 completion tokens spent on hidden reasoning (0.3%). Low — reasoning is effectively suppressed.
+```
+
+The reasoning-token overhead line is the canary for "is `reasoning_effort` actually being honoured on this model and this backend?" — above ~30% is a signal to investigate.
 
 ## Structured JSON output
 
@@ -284,6 +328,35 @@ Qwen, Llama, Nemotron, GLM - they score brilliantly on coding benchmarks now. Th
 **Include surrounding context.** For code generation, send imports, types, and function signatures - not just the function body.
 
 **One call at a time.** As of v2.8.0, houtini-lm enforces this automatically with a request semaphore. Parallel calls queue up and run one at a time, so each gets the full timeout budget instead of stacking.
+
+## Self-test (shakedown)
+
+The canonical way to verify an install and get an honest read on what the loaded model can do on your hardware:
+
+```bash
+npm run shakedown
+```
+
+This runs [`shakedown.mjs`](./shakedown.mjs) — an end-to-end test that exercises all seven tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
+
+Sample output tail:
+
+```
+Summary
+
+   7/7 steps passed on LM Studio, model=nvidia/nemotron-3-nano
+
+| Tool              | OK  | TTFT (ms) | tok/s  | Tokens in→out        | Reasoning | Notes
+| chat              | ✅  |      891  |   36.9 | 48→104               |        —  | answered
+| custom_prompt     | ✅  |      872  |   43.9 | 170→333              |        —  | 5 valid items
+| code_task         | ✅  |      857  |   41.6 | 180→189              |        —  | tests generated
+| code_task_files   | ✅  |   11028   |   39.5 | 6891→3000            |        —  | cross-referenced
+| embed             | ✅  |      —    |     —  | —                    |        —  | 768-dim vector
+
+   Tokens offloaded: 10,915 (prompt: 7,289, completion: 3,626, reasoning: 0)
+```
+
+Want a human-readable quality review rather than just latency numbers? Paste [SHAKEDOWN.md](./SHAKEDOWN.md) into a Claude session that has houtini-lm attached — Claude will drive the seven steps and write you a report on output quality as well as performance.
 
 ## Think-block handling
 
@@ -383,7 +456,10 @@ git clone https://github.com/houtini-ai/lm.git
 cd lm
 npm install
 npm run build
+npm run shakedown    # end-to-end self-test + benchmark
 ```
+
+See [DEVELOPER.md](./DEVELOPER.md) for architecture, internals, the reasoning-model pipeline, backend detection, the SQLite performance cache, and instructions for adding new tools or backends.
 
 ## Licence
 

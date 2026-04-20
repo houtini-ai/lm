@@ -46,6 +46,28 @@ export interface ModelProfile {
   bestFor: string[];
 }
 
+/**
+ * Persisted per-model performance record. Accumulates across sessions so
+ * Claude sees real historical TTFT / tok/s from call 1 of a new session
+ * (instead of "not yet benchmarked"), and so lifetime Claude-quota savings
+ * survive Claude Desktop restarts. Highly personal to the workstation —
+ * that's intentional; routing decisions should reflect the user's real
+ * hardware, not a synthetic benchmark.
+ */
+export interface CachedPerformance {
+  modelId: string;
+  totalCalls: number;
+  ttftCalls: number;          // how many calls had a measurable TTFT
+  totalTtftMs: number;        // sum of TTFTs for averaging
+  perfCalls: number;          // how many calls had measurable tok/s
+  totalTokPerSec: number;     // sum of tok/s values for averaging
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalReasoningTokens: number;
+  firstSeenAt: number;
+  lastUsedAt: number;
+}
+
 // ── Prompt hints ─────────────────────────────────────────────────────
 // Per-family guidance on how to get the best output from each model.
 // Used by the routing layer to shape system prompts and parameters.
@@ -220,6 +242,23 @@ export async function initDb(): Promise<Database> {
     db.run('ALTER TABLE model_profiles ADD COLUMN supports_thinking_toggle INTEGER NOT NULL DEFAULT 0');
   } catch { /* column already exists */ }
 
+  // Per-model performance history — accumulated across sessions.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS model_performance (
+      model_id TEXT PRIMARY KEY,
+      total_calls INTEGER NOT NULL DEFAULT 0,
+      ttft_calls INTEGER NOT NULL DEFAULT 0,
+      total_ttft_ms INTEGER NOT NULL DEFAULT 0,
+      perf_calls INTEGER NOT NULL DEFAULT 0,
+      total_tok_per_sec REAL NOT NULL DEFAULT 0,
+      total_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      total_completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+      first_seen_at INTEGER NOT NULL,
+      last_used_at INTEGER NOT NULL
+    )
+  `);
+
   return db;
 }
 
@@ -366,15 +405,13 @@ function detectThinkingSupport(card: HFModelCard): { emitsThinkBlocks: boolean; 
   // Does the template support enable_thinking toggle? (Qwen3 pattern)
   let supportsThinkingToggle = /enable_thinking/.test(chatTemplate);
 
-  // Architecture-based fallback for gated models where chat_template is unavailable.
-  // These models have extended thinking by default and support disabling it.
+  // Arch/id-based fallback for gated or quantised repos where chat_template is
+  // missing. Reuses the same patterns as the arch-only path so both detection
+  // routes agree on what counts as a thinking model.
   if (!supportsThinkingToggle) {
     const arch = card.config?.architectures?.[0] || '';
-    const archLower = arch.toLowerCase();
-    if (
-      archLower.includes('gemma4') ||                      // Gemma 4 family
-      archLower.includes('gemma4forconditionalgener')       // Gemma4ForConditionalGeneration
-    ) {
+    const fallback = detectThinkingSupportFromArch(arch, card.id || '');
+    if (fallback.supportsThinkingToggle) {
       emitsThinkBlocks = true;
       supportsThinkingToggle = true;
     }
@@ -391,14 +428,28 @@ function detectThinkingSupportFromArch(arch: string, modelId: string): { emitsTh
   const archLower = (arch || '').toLowerCase();
   const idLower = (modelId || '').toLowerCase();
 
-  // Models known to have extended thinking that can be disabled
+  // Architectures that default to extended reasoning. We flag them as
+  // thinking-capable so the inference layer inflates max_tokens and sends
+  // reasoning_effort:"low" (portable across OpenAI, Ollama, LM Studio,
+  // DeepSeek R1, gpt-oss). Detection uses both arch and id because HF cards
+  // for gated/quant'd repos sometimes strip the chat_template.
   const thinkingArchitectures = [
-    'gemma4',       // Gemma 4 (uses reasoning_effort / enable_thinking)
+    'gemma4',         // Gemma 4 — enable_thinking hardcoded true in Jinja
+    'nemotron',       // NVIDIA Nemotron reasoning models (nemotron_h, nemotron_h_moe)
+    'deepseek2',      // DeepSeek R1 / V3 reasoning variants stream reasoning_content
+    'glm4',           // Zhipu GLM-4 — chain-of-thought in-band
+    'gpt-oss',        // OpenAI open-source reasoning model
+    'gpt_oss',
   ];
 
   const thinkingIdPatterns = [
-    /gemma-4/i,     // google/gemma-4-26b-a4b etc.
+    /gemma-4/i,
     /gemma4/i,
+    /nemotron/i,      // nvidia/nemotron-3-nano etc.
+    /deepseek-?r1/i,  // DeepSeek-R1 family
+    /gpt-?oss/i,      // openai/gpt-oss-20b
+    /qwen3.*thinking/i,
+    /\bthinking\b/i,  // any model tagged "-thinking"
   ];
 
   const isThinking = thinkingArchitectures.some(a => archLower.includes(a))
@@ -711,6 +762,192 @@ export async function getAllCachedProfiles(): Promise<CachedModelProfile[]> {
  */
 export async function getThinkingSupport(modelId: string): Promise<{ emitsThinkBlocks: boolean; supportsThinkingToggle: boolean } | null> {
   const cached = await getCachedProfile(modelId);
-  if (!cached) return null;
-  return { emitsThinkBlocks: cached.emitsThinkBlocks, supportsThinkingToggle: cached.supportsThinkingToggle };
+
+  // Re-apply the arch/id fallback at read time so newly-recognised thinking
+  // architectures (e.g. Nemotron, DeepSeek-R1) take effect immediately for
+  // entries that were cached before the detection list was broadened. We OR
+  // with the cached values so we only ever lift flags, never lower them.
+  const archList = cached?.architectures ? safeParseArray(cached.architectures) : [];
+  const archHint = archList[0] || '';
+  const fallback = detectThinkingSupportFromArch(archHint, modelId);
+
+  if (!cached) {
+    return fallback.supportsThinkingToggle ? fallback : null;
+  }
+
+  return {
+    emitsThinkBlocks: cached.emitsThinkBlocks || fallback.emitsThinkBlocks,
+    supportsThinkingToggle: cached.supportsThinkingToggle || fallback.supportsThinkingToggle,
+  };
+}
+
+function safeParseArray(s: string): string[] {
+  try {
+    const parsed = JSON.parse(s);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// ── Performance history (per-model, cross-session) ───────────────────
+
+function rowToPerformance(row: Record<string, unknown>): CachedPerformance {
+  return {
+    modelId: row.model_id as string,
+    totalCalls: row.total_calls as number,
+    ttftCalls: row.ttft_calls as number,
+    totalTtftMs: row.total_ttft_ms as number,
+    perfCalls: row.perf_calls as number,
+    totalTokPerSec: row.total_tok_per_sec as number,
+    totalPromptTokens: row.total_prompt_tokens as number,
+    totalCompletionTokens: row.total_completion_tokens as number,
+    totalReasoningTokens: row.total_reasoning_tokens as number,
+    firstSeenAt: row.first_seen_at as number,
+    lastUsedAt: row.last_used_at as number,
+  };
+}
+
+/**
+ * Fetch lifetime performance stats for a single model, or null if the model
+ * has never been used on this workstation.
+ */
+export async function getPerformance(modelId: string): Promise<CachedPerformance | null> {
+  if (!modelId) return null;
+  const database = await initDb();
+  const stmt = database.prepare('SELECT * FROM model_performance WHERE model_id = ?');
+  try {
+    stmt.bind([modelId]);
+    if (stmt.step()) {
+      return rowToPerformance(stmt.getAsObject() as Record<string, unknown>);
+    }
+    return null;
+  } finally {
+    stmt.free();
+  }
+}
+
+/**
+ * Fetch all per-model performance records (used for routing and for seeding
+ * the in-memory view at startup).
+ */
+export async function getAllPerformance(): Promise<CachedPerformance[]> {
+  const database = await initDb();
+  const stmt = database.prepare('SELECT * FROM model_performance ORDER BY last_used_at DESC');
+  const results: CachedPerformance[] = [];
+  try {
+    while (stmt.step()) {
+      results.push(rowToPerformance(stmt.getAsObject() as Record<string, unknown>));
+    }
+  } finally {
+    stmt.free();
+  }
+  return results;
+}
+
+/**
+ * Fetch workstation-wide lifetime totals: every call, every token ever
+ * offloaded to local models, across every session. Used for the "Claude
+ * quota saved" footer and the discover overview.
+ */
+export async function getLifetimeTotals(): Promise<{ totalTokens: number; totalCalls: number; modelsUsed: number; firstSeenAt: number | null }> {
+  const database = await initDb();
+  const stmt = database.prepare(`
+    SELECT
+      COALESCE(SUM(total_prompt_tokens + total_completion_tokens), 0) AS total_tokens,
+      COALESCE(SUM(total_calls), 0) AS total_calls,
+      COUNT(*) AS models_used,
+      MIN(first_seen_at) AS first_seen_at
+    FROM model_performance
+  `);
+  try {
+    if (stmt.step()) {
+      const row = stmt.getAsObject() as Record<string, unknown>;
+      return {
+        totalTokens: (row.total_tokens as number) || 0,
+        totalCalls: (row.total_calls as number) || 0,
+        modelsUsed: (row.models_used as number) || 0,
+        firstSeenAt: (row.first_seen_at as number | null) ?? null,
+      };
+    }
+    return { totalTokens: 0, totalCalls: 0, modelsUsed: 0, firstSeenAt: null };
+  } finally {
+    stmt.free();
+  }
+}
+
+/**
+ * Append a single call's usage + timing to the per-model performance record.
+ * Creates the row on first use, upserts thereafter. Caller should fire-and-
+ * forget — failures here must not block a tool response.
+ */
+export async function recordPerformance(
+  modelId: string,
+  opts: {
+    ttftMs?: number;
+    tokPerSec?: number;
+    promptTokens: number;
+    completionTokens: number;
+    reasoningTokens?: number;
+  },
+): Promise<void> {
+  if (!modelId) return;
+  const database = await initDb();
+  const now = Date.now();
+  const ttftDelta = opts.ttftMs && opts.ttftMs > 0 ? opts.ttftMs : 0;
+  const ttftCallDelta = ttftDelta > 0 ? 1 : 0;
+  const perfDelta = opts.tokPerSec && opts.tokPerSec > 0 ? opts.tokPerSec : 0;
+  const perfCallDelta = perfDelta > 0 ? 1 : 0;
+  const reasoningDelta = opts.reasoningTokens ?? 0;
+
+  const existing = await getPerformance(modelId);
+
+  if (existing) {
+    database.run(
+      `UPDATE model_performance SET
+        total_calls = ?,
+        ttft_calls = ?,
+        total_ttft_ms = ?,
+        perf_calls = ?,
+        total_tok_per_sec = ?,
+        total_prompt_tokens = ?,
+        total_completion_tokens = ?,
+        total_reasoning_tokens = ?,
+        last_used_at = ?
+      WHERE model_id = ?`,
+      [
+        existing.totalCalls + 1,
+        existing.ttftCalls + ttftCallDelta,
+        existing.totalTtftMs + ttftDelta,
+        existing.perfCalls + perfCallDelta,
+        existing.totalTokPerSec + perfDelta,
+        existing.totalPromptTokens + opts.promptTokens,
+        existing.totalCompletionTokens + opts.completionTokens,
+        existing.totalReasoningTokens + reasoningDelta,
+        now,
+        modelId,
+      ],
+    );
+  } else {
+    database.run(
+      `INSERT INTO model_performance (
+        model_id, total_calls, ttft_calls, total_ttft_ms, perf_calls, total_tok_per_sec,
+        total_prompt_tokens, total_completion_tokens, total_reasoning_tokens,
+        first_seen_at, last_used_at
+      ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        modelId,
+        ttftCallDelta,
+        ttftDelta,
+        perfCallDelta,
+        perfDelta,
+        opts.promptTokens,
+        opts.completionTokens,
+        reasoningDelta,
+        now,
+        now,
+      ],
+    );
+  }
+  saveDb();
 }

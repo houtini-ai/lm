@@ -6,6 +6,7 @@ add-shebang.mjs
 # Test and benchmark scripts (not part of the published package)
 test.mjs
 benchmark.mjs
+shakedown.mjs
 
 # Developer docs — keep README.md, CHANGELOG.md, and LICENSE (auto-included)
 *.md
@@ -21,6 +22,8 @@ benchmark.mjs
 .vscode/
 .idea/
 .claude/
+memory/
+MEMORY.md
 .DS_Store
 Thumbs.db
 *.swp

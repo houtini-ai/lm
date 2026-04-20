@@ -21,6 +21,9 @@ import {
   getHFEnrichmentLine,
   getPromptHints,
   getThinkingSupport,
+  recordPerformance,
+  getAllPerformance,
+  getLifetimeTotals,
   type PromptHints,
 } from './model-cache.js';
 import { readFile } from 'node:fs/promises';
@@ -34,7 +37,9 @@ const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
 const INFERENCE_CONNECT_TIMEOUT_MS = 30_000; // generous connect timeout for inference
 const SOFT_TIMEOUT_MS = 300_000;             // 5 min — progress notifications reset MCP client timeout, so this is a safety net not the primary limit
-const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk
+const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk mid-stream
+const PREFILL_TIMEOUT_MS = 180_000;          // max wait for the FIRST chunk — prompt prefill on slow hardware with big inputs can legitimately take 1-2 min
+const PREFILL_KEEPALIVE_MS = 10_000;         // fire a progress notification every N ms while waiting for prefill to finish
 const FALLBACK_CONTEXT_LENGTH = parseInt(process.env.LM_CONTEXT_WINDOW || '100000', 10);
 
 // ── Session-level token accounting ───────────────────────────────────
@@ -50,16 +55,68 @@ const session = {
   modelStats: new Map<string, { calls: number; ttftCalls: number; perfCalls: number; totalTtftMs: number; totalTokPerSec: number }>(),
 };
 
+// Lifetime mirror — kept in sync with the SQLite `model_performance` table
+// so the footer/discover path stays synchronous. Hydrated once at startup
+// from `getAllPerformance()`, then updated in-memory alongside every DB
+// write in `recordUsage`. Also updated after the async DB write completes
+// so counters can only ever run a tick behind, never ahead.
+const lifetime = {
+  totalCalls: 0,
+  totalTokens: 0,
+  modelsUsed: 0,
+  firstSeenAt: null as number | null,
+  /** Per-model lifetime stats — same shape as session.modelStats for easy formatting. */
+  modelStats: new Map<string, { calls: number; ttftCalls: number; perfCalls: number; totalTtftMs: number; totalTokPerSec: number; totalPromptTokens: number; firstSeenAt: number; lastUsedAt: number }>(),
+};
+
+async function hydrateLifetimeFromDb(): Promise<void> {
+  try {
+    const totals = await getLifetimeTotals();
+    lifetime.totalCalls = totals.totalCalls;
+    lifetime.totalTokens = totals.totalTokens;
+    lifetime.modelsUsed = totals.modelsUsed;
+    lifetime.firstSeenAt = totals.firstSeenAt;
+
+    const rows = await getAllPerformance();
+    lifetime.modelStats.clear();
+    for (const r of rows) {
+      lifetime.modelStats.set(r.modelId, {
+        calls: r.totalCalls,
+        ttftCalls: r.ttftCalls,
+        perfCalls: r.perfCalls,
+        totalTtftMs: r.totalTtftMs,
+        totalTokPerSec: r.totalTokPerSec,
+        totalPromptTokens: r.totalPromptTokens,
+        firstSeenAt: r.firstSeenAt,
+        lastUsedAt: r.lastUsedAt,
+      });
+    }
+  } catch (err) {
+    process.stderr.write(`[houtini-lm] Lifetime hydration failed (stats will build from this session): ${err}\n`);
+  }
+}
+
 function recordUsage(resp: StreamingResult) {
   session.calls++;
+  const promptTokens = resp.usage?.prompt_tokens ?? 0;
+  let completionTokens = resp.usage?.completion_tokens ?? 0;
+  const reasoningTokens = resp.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
   if (resp.usage) {
-    session.promptTokens += resp.usage.prompt_tokens;
-    session.completionTokens += resp.usage.completion_tokens;
+    session.promptTokens += promptTokens;
+    session.completionTokens += completionTokens;
   } else if (resp.content.length > 0) {
     // Estimate when usage is missing (truncated responses)
-    session.completionTokens += Math.ceil(resp.content.length / 4);
+    const est = Math.ceil(resp.content.length / 4);
+    completionTokens = est;
+    session.completionTokens += est;
   }
-  // Track per-model perf stats
+
+  // Tok/s used by both session and lifetime stats
+  const tokPerSec = resp.usage && resp.generationMs > 50
+    ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
+    : 0;
+
+  // Session per-model (unchanged behaviour)
   if (resp.model) {
     const existing = session.modelStats.get(resp.model) || { calls: 0, ttftCalls: 0, perfCalls: 0, totalTtftMs: 0, totalTokPerSec: 0 };
     existing.calls++;
@@ -67,22 +124,70 @@ function recordUsage(resp: StreamingResult) {
       existing.totalTtftMs += resp.ttftMs;
       existing.ttftCalls++;
     }
-    const tokPerSec = resp.usage && resp.generationMs > 50
-      ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
-      : 0;
     if (tokPerSec > 0) {
       existing.perfCalls++;
       existing.totalTokPerSec += tokPerSec;
     }
     session.modelStats.set(resp.model, existing);
   }
+
+  // Lifetime mirror + SQLite write — fire-and-forget so a DB hiccup can't
+  // stall a tool response. The in-memory mirror is updated synchronously so
+  // the footer and discover output reflect this call immediately.
+  if (resp.model && (promptTokens > 0 || completionTokens > 0)) {
+    const now = Date.now();
+    const wasFirstEver = !lifetime.modelStats.has(resp.model);
+    const lExisting = lifetime.modelStats.get(resp.model) || {
+      calls: 0, ttftCalls: 0, perfCalls: 0, totalTtftMs: 0, totalTokPerSec: 0, totalPromptTokens: 0,
+      firstSeenAt: now, lastUsedAt: now,
+    };
+    lExisting.calls++;
+    if (resp.ttftMs) {
+      lExisting.totalTtftMs += resp.ttftMs;
+      lExisting.ttftCalls++;
+    }
+    if (tokPerSec > 0) {
+      lExisting.perfCalls++;
+      lExisting.totalTokPerSec += tokPerSec;
+    }
+    lExisting.totalPromptTokens += promptTokens;
+    lExisting.lastUsedAt = now;
+    lifetime.modelStats.set(resp.model, lExisting);
+
+    lifetime.totalCalls++;
+    lifetime.totalTokens += promptTokens + completionTokens;
+    if (wasFirstEver) {
+      lifetime.modelsUsed++;
+      if (lifetime.firstSeenAt === null) lifetime.firstSeenAt = now;
+    }
+
+    recordPerformance(resp.model, {
+      ttftMs: resp.ttftMs,
+      tokPerSec: tokPerSec > 0 ? tokPerSec : undefined,
+      promptTokens,
+      completionTokens,
+      reasoningTokens,
+    }).catch((err) => {
+      process.stderr.write(`[houtini-lm] Performance write failed (continuing): ${err}\n`);
+    });
+  }
 }
 
 function sessionSummary(): string {
   const total = session.promptTokens + session.completionTokens;
-  if (session.calls === 0) return '';
-  const callWord = session.calls === 1 ? 'call' : 'calls';
-  return `💰 Claude quota saved this session: ${total.toLocaleString()} tokens across ${session.calls} offloaded ${callWord}`;
+  if (session.calls === 0 && lifetime.totalCalls === 0) return '';
+
+  const callWord = (n: number) => (n === 1 ? 'call' : 'calls');
+  const sessionPart = session.calls > 0
+    ? `this session: ${total.toLocaleString()} tokens / ${session.calls} ${callWord(session.calls)}`
+    : 'this session: 0 tokens';
+
+  // Lifetime numbers only show once there's something in the DB — avoids a
+  // confusing "lifetime: 0" on a truly fresh install.
+  if (lifetime.totalCalls > 0) {
+    return `💰 Claude quota saved — ${sessionPart} · lifetime: ${lifetime.totalTokens.toLocaleString()} tokens / ${lifetime.totalCalls} ${callWord(lifetime.totalCalls)}`;
+  }
+  return `💰 Claude quota saved ${sessionPart}`;
 }
 
 /**
@@ -130,8 +235,16 @@ interface StreamingResult {
   content: string;
   /** Raw content before think-block stripping (for quality assessment) */
   rawContent: string;
+  /** Reasoning content streamed via OpenAI vendor extension delta.reasoning_content */
+  reasoningContent?: string;
   model: string;
-  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    /** OpenAI: how many of the completion tokens were reasoning (hidden) */
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
   finishReason: string;
   truncated: boolean;
   /** Time to first token in milliseconds */
@@ -140,6 +253,10 @@ interface StreamingResult {
   generationMs: number;
   /** True when think-block stripping left nothing and we fell back to raw content */
   thinkStripFallback?: boolean;
+  /** True when no visible content arrived and we fell back to reasoning_content */
+  reasoningFallback?: boolean;
+  /** Truncation caused by prefill stall (no chunks received) vs mid-stream stall */
+  prefillStall?: boolean;
 }
 
 /** OpenAI-compatible response_format for structured output */
@@ -478,6 +595,10 @@ async function chatCompletionStreamingInner(
     messages,
     temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     max_tokens: effectiveMaxTokens,
+    // Send max_completion_tokens alongside max_tokens for OpenAI reasoning-model
+    // compatibility (OpenAI spec distinguishes total generation cap from visible
+    // output cap). Backends that don't understand it ignore unknown fields.
+    max_completion_tokens: effectiveMaxTokens,
     stream: true,
     stream_options: { include_usage: true },
   };
@@ -489,23 +610,36 @@ async function chatCompletionStreamingInner(
   }
 
   // Handle thinking/reasoning models.
-  // Some models (Gemma 4, Qwen3, DeepSeek) have extended thinking that consumes
-  // part of the max_tokens budget for invisible reasoning before producing content.
-  // Strategy: try to disable thinking via enable_thinking=false, BUT also inflate
-  // max_tokens as a safety net since some models (Gemma 4) hardcode thinking=true
-  // in their Jinja template and ignore the API parameter.
+  // Some models (Gemma 4, Qwen3, DeepSeek R1, Nemotron, gpt-oss) have extended
+  // thinking that consumes part of the max_tokens budget for invisible reasoning
+  // before producing content. Strategy:
+  //   1. reasoning_effort=<family-specific value> to minimise reasoning
+  //   2. enable_thinking:false — Qwen3 vendor param (ignored elsewhere)
+  //   3. inflate max_tokens 4× — safety net when both flags are ignored
+  //      (e.g. Gemma 4 hardcodes enable_thinking=true in its Jinja template)
+  //
+  // IMPORTANT: reasoning_effort values are NOT standard. OpenAI/gpt-oss use
+  // 'low'|'medium'|'high'; Ollama adds 'none'; LM Studio's Nemotron adapter
+  // only accepts 'on'|'off'. Sending 'low' to Nemotron causes LM Studio to
+  // silently fall back to 'on' — maximising reasoning, the OPPOSITE of intent.
+  // Hence the family-specific mapping below. When uncertain, we omit the
+  // field entirely rather than risk a bad-value fallback.
   const modelId = (options.model || LM_MODEL || '').toString();
   if (modelId) {
     const thinking = await getThinkingSupport(modelId);
     if (thinking?.supportsThinkingToggle) {
       body.enable_thinking = false;
-      // Safety net: inflate max_tokens to account for reasoning budget.
-      // Gemma 4 ignores enable_thinking=false (hardcoded in template),
-      // so the model will think regardless. Without inflation, reasoning
-      // consumes all tokens and content comes back empty.
-      const requestedTokens = (options.maxTokens ?? DEFAULT_MAX_TOKENS);
-      body.max_tokens = Math.max(requestedTokens * 4, requestedTokens + 2000);
-      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: enable_thinking=false, max_tokens inflated ${requestedTokens} → ${body.max_tokens}\n`);
+      const reasoningValue = getReasoningEffortValue(modelId);
+      if (reasoningValue !== null) {
+        body.reasoning_effort = reasoningValue;
+      }
+      // Inflation uses effectiveMaxTokens (the context-aware value), not
+      // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
+      const beforeInflation = effectiveMaxTokens;
+      const inflated = Math.max(beforeInflation * 4, beforeInflation + 2000);
+      body.max_tokens = inflated;
+      body.max_completion_tokens = inflated;
+      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
     }
   }
 
@@ -529,13 +663,39 @@ async function chatCompletionStreamingInner(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let content = '';
-  let chunkCount = 0;
+  let reasoning = '';
+  let progressSeq = 0;
   let model = '';
   let usage: StreamingResult['usage'];
   let finishReason = '';
   let truncated = false;
+  let prefillStall = false;
   let buffer = '';
   let ttftMs: number | undefined;
+  let firstChunkReceived = false;
+
+  // Prefill keep-alive — /v1/chat/completions gives no SSE events during
+  // prompt processing, so the MCP client clock ticks uninterrupted on a slow
+  // backend with a big input. Fire a progress notification every 10s until
+  // the first chunk arrives to keep the client from timing out at 60s.
+  const sendProgress = (message: string) => {
+    if (options.progressToken === undefined) return;
+    progressSeq++;
+    server.notification({
+      method: 'notifications/progress',
+      params: {
+        progressToken: options.progressToken,
+        progress: progressSeq,
+        message,
+      },
+    }).catch(() => { /* best-effort — don't break streaming */ });
+  };
+
+  const keepAliveTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    if (firstChunkReceived) return;
+    const waitedMs = Date.now() - startTime;
+    sendProgress(`Waiting for model... (${(waitedMs / 1000).toFixed(0)}s, still in prefill)`);
+  }, PREFILL_KEEPALIVE_MS);
 
   try {
     while (true) {
@@ -547,18 +707,26 @@ async function chatCompletionStreamingInner(
         break;
       }
 
-      // Read with per-chunk timeout (handles stalled generation)
+      // Split prefill vs mid-stream timeouts. Prefill on slow hardware with
+      // a 7k-token input can legitimately take 1-2 min; mid-stream stalls
+      // should surface much faster. Track firstChunkReceived to switch.
       const remaining = SOFT_TIMEOUT_MS - elapsed;
-      const chunkTimeout = Math.min(READ_CHUNK_TIMEOUT_MS, remaining);
+      const perChunkCeiling = firstChunkReceived ? READ_CHUNK_TIMEOUT_MS : PREFILL_TIMEOUT_MS;
+      const chunkTimeout = Math.min(perChunkCeiling, remaining);
       const result = await timedRead(reader, chunkTimeout);
 
       if (result === 'timeout') {
         truncated = true;
-        process.stderr.write(`[houtini-lm] Chunk read timeout, returning ${content.length} chars of partial content\n`);
+        prefillStall = !firstChunkReceived;
+        process.stderr.write(`[houtini-lm] ${prefillStall ? 'Prefill' : 'Mid-stream'} timeout, returning ${content.length} chars of partial content\n`);
         break;
       }
 
       if (result.done) break;
+
+      if (!firstChunkReceived) {
+        firstChunkReceived = true;
+      }
 
       buffer += decoder.decode(result.value, { stream: true });
 
@@ -577,41 +745,20 @@ async function chatCompletionStreamingInner(
 
           const delta = json.choices?.[0]?.delta;
 
-          // Track reasoning/thinking tokens — models like Gemma 4, Qwen3, DeepSeek
-          // emit reasoning_content during their thinking phase before producing
-          // visible content. We must send progress notifications during this phase
-          // to prevent MCP client timeout.
-          if (delta?.reasoning_content) {
-            chunkCount++;
-            if (options.progressToken !== undefined) {
-              server.notification({
-                method: 'notifications/progress',
-                params: {
-                  progressToken: options.progressToken,
-                  progress: chunkCount,
-                  message: `Thinking... (${chunkCount} chunks)`,
-                },
-              }).catch(() => { /* best-effort */ });
-            }
+          // Reasoning channel. LM Studio (with "Separate reasoning_content"
+          // dev setting), DeepSeek R1, Ollama OpenAI-compat, Nemotron etc.
+          // stream reasoning via delta.reasoning_content — we MUST capture it
+          // so the safety net below can return something when the model
+          // burns its entire budget before emitting a single content token.
+          if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+            reasoning += delta.reasoning_content;
+            sendProgress(`Thinking... (${reasoning.length} chars of reasoning)`);
           }
 
-          if (delta?.content) {
+          if (typeof delta?.content === 'string' && delta.content.length > 0) {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             content += delta.content;
-            chunkCount++;
-            // Send progress notification to reset MCP client timeout.
-            // Each notification resets the 60s clock, giving slow models
-            // unlimited time as long as they're actively generating.
-            if (options.progressToken !== undefined) {
-              server.notification({
-                method: 'notifications/progress',
-                params: {
-                  progressToken: options.progressToken,
-                  progress: chunkCount,
-                  message: `Streaming... ${content.length} chars`,
-                },
-              }).catch(() => { /* best-effort — don't break streaming */ });
-            }
+            sendProgress(`Streaming... ${content.length} chars`);
           }
 
           const reason = json.choices?.[0]?.finish_reason;
@@ -634,7 +781,10 @@ async function chatCompletionStreamingInner(
           const json = JSON.parse(trimmed.slice(6));
           if (json.model) model = json.model;
           const delta = json.choices?.[0]?.delta;
-          if (delta?.content) {
+          if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+            reasoning += delta.reasoning_content;
+          }
+          if (typeof delta?.content === 'string' && delta.content.length > 0) {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             content += delta.content;
           }
@@ -648,6 +798,7 @@ async function chatCompletionStreamingInner(
       }
     }
   } finally {
+    clearInterval(keepAliveTimer);
     // Best-effort cancel with a short timeout — cancel() can hang if the upstream
     // connection is wedged, so we race it against a 500ms timer. This frees the
     // underlying socket sooner on abrupt client disconnects without blocking the
@@ -664,33 +815,68 @@ async function chatCompletionStreamingInner(
   const generationMs = Date.now() - startTime;
 
   // Strip <think>...</think> reasoning blocks from models that always emit them
-  // (e.g. GLM Flash, Nemotron). Claude doesn't need the model's internal reasoning.
-  // Handle both closed blocks and unclosed ones (model ran out of tokens mid-think,
-  // or grammar-constrained output forced content before the closing tag).
+  // inline on the content channel (e.g. GLM Flash). Claude doesn't need the
+  // model's internal reasoning. Handle both closed and unclosed blocks.
   let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');  // closed blocks
   cleanContent = cleanContent.replace(/^<think>\s*/, '');                   // orphaned opening tag
   cleanContent = cleanContent.trim();
 
-  // Safety net on top of the thinking-model max_tokens inflation: some MLX/GGUF
-  // quants still exhaust their budget inside an unclosed <think> block despite
-  // `enable_thinking:false` and the 4× inflation. If stripping leaves nothing but
-  // raw output exists, return the raw reasoning so the caller sees *something*
-  // rather than an empty body + lone footer (issue #6).
+  // Safety nets for empty visible output. Try in order:
+  //   1. thinkStripFallback: stripping <think> left nothing, but raw content had text
+  //   2. reasoningFallback: no visible content AT ALL, but reasoning_content was streamed
+  //      (this is the Nemotron/DeepSeek-R1/LM-Studio-dev-toggle case — previously
+  //      produced silent empty bodies because reasoning was discarded)
   let thinkStripFallback = false;
-  if (!cleanContent && content.trim()) {
-    thinkStripFallback = true;
-    cleanContent = content.trim();
+  let reasoningFallback = false;
+  if (!cleanContent) {
+    if (content.trim()) {
+      thinkStripFallback = true;
+      cleanContent = content.trim();
+    } else if (reasoning.trim()) {
+      reasoningFallback = true;
+      cleanContent =
+        '[No visible output — the model spent its entire output budget on reasoning_content before emitting any content. ' +
+        'Raw reasoning below so you can see what it was doing:]\n\n' +
+        reasoning.trim();
+    }
   }
 
-  return { content: cleanContent, rawContent: content, model, usage, finishReason, truncated, ttftMs, generationMs, thinkStripFallback };
+  return {
+    content: cleanContent,
+    rawContent: content,
+    reasoningContent: reasoning || undefined,
+    model,
+    usage,
+    finishReason,
+    truncated,
+    ttftMs,
+    generationMs,
+    thinkStripFallback,
+    reasoningFallback,
+    prefillStall,
+  };
+}
+
+// Backend detection. Probed once on first listModelsRaw() call, cached for
+// the session. We keep inference on the portable /v1/chat/completions path
+// regardless of backend — this flag is for enrichment (richer model metadata,
+// accurate "it's LM Studio, so the dev-toggle for reasoning_content matters"
+// hints in diagnostics, etc.).
+type Backend = 'lmstudio' | 'ollama' | 'openai-compat';
+let detectedBackend: Backend | null = null;
+
+function getBackend(): Backend {
+  return detectedBackend ?? 'openai-compat';
 }
 
 /**
- * Fetch models from LM Studio's native v0 API first (richer metadata),
- * falling back to the OpenAI-compatible v1 endpoint for non-LM-Studio hosts.
+ * Fetch models with backend-aware probing.
+ *   1. LM Studio /api/v0/models — richest metadata, sets backend='lmstudio'
+ *   2. Ollama /api/tags           — native list, sets backend='ollama', maps to ModelInfo
+ *   3. OpenAI-compatible /v1/models — generic fallback (DeepSeek, vLLM, llama.cpp, OpenRouter)
  */
 async function listModelsRaw(): Promise<ModelInfo[]> {
-  // Try v0 API first — returns type, arch, publisher, quantization, state
+  // Try LM Studio's v0 API first — returns type, arch, publisher, quantization, state
   try {
     const v0 = await fetchWithTimeout(
       `${LM_BASE_URL}/api/v0/models`,
@@ -698,19 +884,54 @@ async function listModelsRaw(): Promise<ModelInfo[]> {
     );
     if (v0.ok) {
       const data = (await v0.json()) as { data: ModelInfo[] };
+      detectedBackend = 'lmstudio';
       return data.data;
     }
   } catch {
-    // v0 not available — fall through to v1
+    // v0 not available — fall through
   }
 
-  // Fallback: OpenAI-compatible v1 endpoint (works with Ollama, vLLM, llama.cpp)
+  // Try Ollama's /api/tags next. Shape differs from OpenAI: returns
+  // { models: [{ name, model, size, details: { family, parameter_size, ... } }] }
+  try {
+    const tags = await fetchWithTimeout(
+      `${LM_BASE_URL}/api/tags`,
+      { headers: apiHeaders() },
+    );
+    if (tags.ok) {
+      const data = (await tags.json()) as {
+        models?: Array<{
+          name: string;
+          model?: string;
+          size?: number;
+          details?: { family?: string; parameter_size?: string; quantization_level?: string };
+        }>;
+      };
+      if (Array.isArray(data.models)) {
+        detectedBackend = 'ollama';
+        return data.models.map((m) => ({
+          id: m.name,
+          object: 'model',
+          type: 'llm',
+          arch: m.details?.family,
+          quantization: m.details?.quantization_level,
+          state: 'loaded', // Ollama loads on-demand; treat all listed as available
+          publisher: m.name.includes('/') ? m.name.split('/')[0] : undefined,
+        }));
+      }
+    }
+  } catch {
+    // Not Ollama — fall through
+  }
+
+  // Fallback: OpenAI-compatible v1 endpoint (DeepSeek, vLLM, llama.cpp, OpenRouter)
   const res = await fetchWithTimeout(
     `${LM_BASE_URL}/v1/models`,
     { headers: apiHeaders() },
   );
   if (!res.ok) throw new Error(`Failed to list models: ${res.status}`);
   const data = (await res.json()) as { data: ModelInfo[] };
+  detectedBackend = 'openai-compat';
   return data.data;
 }
 
@@ -722,6 +943,94 @@ function getContextLength(model: ModelInfo): number {
 
 function getMaxContextLength(model: ModelInfo): number | undefined {
   return model.max_context_length;
+}
+
+/**
+ * Map model family / backend → reasoning_effort value that minimises reasoning.
+ *
+ * The `reasoning_effort` field exists across OpenAI, Ollama, LM Studio and
+ * DeepSeek, but the accepted values differ per vendor. Verified empirically
+ * from the LM Studio error response: "Supported values: none, minimal, low,
+ * medium, high, xhigh" (that's the set the LM Studio adapter accepts).
+ *
+ *   OpenAI (gpt-5, o-series)        : 'low' | 'medium' | 'high' (spec)
+ *   Ollama                          : 'low' | 'medium' | 'high' | 'none'
+ *   LM Studio (all models)          : 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+ *
+ * We want the HARDEST off-switch we can portably send:
+ *   - LM Studio / Ollama: 'none'  (no reasoning budget at all)
+ *   - Generic OpenAI-compat: 'low' (OpenAI's minimum, safe to send)
+ *
+ * An unsupported value is a hard 400 error on LM Studio (not a silent
+ * fallback), so this function is conservative — it returns null for
+ * unknown backends and we omit the field rather than risk a 400.
+ */
+function getReasoningEffortValue(_modelId: string): string | null {
+  const backend = getBackend();
+  // LM Studio accepts 'none' as an explicit reasoning-off switch for
+  // every thinking model (Nemotron, DeepSeek R1, Gemma 4, gpt-oss, ...).
+  if (backend === 'lmstudio') return 'none';
+  // Ollama likewise documents 'none' as valid.
+  if (backend === 'ollama') return 'none';
+  // Generic OpenAI-compatible — 'low' is the minimum OpenAI accepts per spec.
+  // DeepSeek's own API treats 'low' as minimum too.
+  return 'low';
+}
+
+/** Rough chars→tokens ratio used for pre-flight estimates. Matches the ratio
+ * we already use to estimate completion_tokens when usage is missing. */
+const CHARS_PER_TOKEN = 4;
+
+/** Conservative default prefill rate when no per-model measurement exists.
+ * Slower than real hardware so we err toward letting the call run — a false
+ * refusal is much worse than a false-ok that eventually times out. */
+const DEFAULT_PREFILL_TOK_PER_SEC = 300;
+
+/** Hard ceiling for when we refuse to send the call. Leaves ~15s of
+ * generation headroom inside the ~60s MCP-client request-timeout budget. */
+const PREFILL_REFUSE_THRESHOLD_SEC = 45;
+
+/** Soft warning threshold — we proceed but log a stderr warning. */
+const PREFILL_WARN_THRESHOLD_SEC = 25;
+
+interface PrefillEstimate {
+  inputTokens: number;
+  estimatedSeconds: number;
+  prefillTokPerSec: number;
+  basis: 'measured' | 'default';
+}
+
+/**
+ * Estimate how long prompt prefill will take, using measured per-model data
+ * from the SQLite cache when available. `totalTtftMs` is very close to pure
+ * prefill time for a streaming call (first-content-delta arrives right after
+ * prefill finishes), so `totalPromptTokens / totalTtftMs` gives a usable
+ * prefill-tok/s rate for that specific (model, hardware) pair.
+ */
+function estimatePrefill(inputChars: number, modelId: string): PrefillEstimate {
+  const inputTokens = Math.ceil(inputChars / CHARS_PER_TOKEN);
+  const stats = lifetime.modelStats.get(modelId);
+  let prefillTokPerSec = DEFAULT_PREFILL_TOK_PER_SEC;
+  let basis: 'measured' | 'default' = 'default';
+
+  if (stats && stats.ttftCalls >= 2 && stats.totalTtftMs > 0 && stats.totalPromptTokens > 0) {
+    // Only trust measured data after >=2 TTFT samples — single samples on a
+    // cold model run are noisy. Average prompt tokens per call approximated
+    // as totalPromptTokens / calls, then divided by average TTFT seconds.
+    const avgPromptTokens = stats.totalPromptTokens / stats.calls;
+    const avgTtftSec = (stats.totalTtftMs / stats.ttftCalls) / 1000;
+    if (avgTtftSec > 0) {
+      prefillTokPerSec = avgPromptTokens / avgTtftSec;
+      basis = 'measured';
+    }
+  }
+
+  return {
+    inputTokens,
+    estimatedSeconds: inputTokens / prefillTokPerSec,
+    prefillTokPerSec,
+    basis,
+  };
 }
 
 // ── Model routing ─────────────────────────────────────────────────────
@@ -808,9 +1117,11 @@ async function routeToModel(taskType: TaskType): Promise<RoutingDecision> {
 
 interface QualitySignal {
   truncated: boolean;
+  prefillStall: boolean;       // truncation occurred before any chunk arrived
   finishReason: string;
   thinkBlocksStripped: boolean;
   thinkStripFallback: boolean;  // strip emptied content; returning raw as fallback
+  reasoningFallback: boolean;   // no visible content; returning raw reasoning_content
   estimatedTokens: boolean;   // true when usage was missing and we estimated
   contentLength: number;
   generationMs: number;
@@ -826,9 +1137,11 @@ function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal
 
   return {
     truncated: resp.truncated,
+    prefillStall: resp.prefillStall ?? false,
     finishReason: resp.finishReason || 'unknown',
     thinkBlocksStripped: hadThinkBlocks,
     thinkStripFallback: resp.thinkStripFallback ?? false,
+    reasoningFallback: resp.reasoningFallback ?? false,
     estimatedTokens: estimated,
     contentLength: resp.content.length,
     generationMs: resp.generationMs,
@@ -838,8 +1151,10 @@ function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal
 
 function formatQualityLine(quality: QualitySignal): string {
   const flags: string[] = [];
-  if (quality.truncated) flags.push('TRUNCATED');
-  if (quality.thinkStripFallback) flags.push('think-strip-empty (showing raw reasoning — model ignored enable_thinking:false)');
+  if (quality.prefillStall) flags.push('PREFILL-STALL (no tokens received — input may be too large for this model/hardware)');
+  else if (quality.truncated) flags.push('TRUNCATED');
+  if (quality.reasoningFallback) flags.push('reasoning-only (model exhausted output budget before emitting visible content — showing raw reasoning)');
+  else if (quality.thinkStripFallback) flags.push('think-strip-empty (showing raw reasoning — model ignored enable_thinking:false)');
   else if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
   if (quality.estimatedTokens) flags.push('tokens-estimated');
   if (quality.finishReason === 'length') flags.push('hit-max-tokens');
@@ -863,7 +1178,16 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   const parts: string[] = [];
   if (resp.model) parts.push(`Model: ${resp.model}`);
   if (resp.usage) {
-    parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
+    // OpenAI-spec reasoning-tokens split — when present, show it so the user
+    // sees how much of the completion budget went to hidden reasoning vs
+    // visible output. Diagnoses "empty body + hit-max-tokens" immediately.
+    const reasoningTokens = resp.usage.completion_tokens_details?.reasoning_tokens;
+    if (typeof reasoningTokens === 'number' && reasoningTokens > 0) {
+      const visible = resp.usage.completion_tokens - reasoningTokens;
+      parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens (${reasoningTokens} reasoning / ${visible} visible)`);
+    } else {
+      parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
+    }
   } else if (resp.content.length > 0) {
     // Estimate when usage is missing (truncated responses where final SSE chunk was lost)
     const estTokens = Math.ceil(resp.content.length / 4);
@@ -1050,11 +1374,13 @@ const TOOLS = [
       '• Provide absolute paths. Relative paths are rejected.\n' +
       '• Files are read in parallel (Promise.allSettled) — one unreadable file does not sink the call.\n' +
       '• Files are concatenated with `=== filename ===` headers and sent to the same code-review pipeline as code_task.\n' +
-      '• Read failures are surfaced inline with the reason so the LLM can still reason about the rest.\n\n' +
+      '• Read failures are surfaced inline with the reason so the LLM can still reason about the rest.\n' +
+      '• Pre-flight prefill estimate: if measured per-model data shows the input would exceed the MCP client\'s ~60s request timeout during prompt processing, the call is refused early with a diagnostic instead of hanging. Split or trim when this fires.\n\n' +
       'Good fit:\n' +
       '• Reviewing related files together (module + its tests, client + server pair)\n' +
       '• Auditing a single large file too big to paste comfortably\n' +
       '• Any code_task where keeping source out of the Claude context window matters\n\n' +
+      'Size guidance: on slow hardware (< 25 tok/s generation), keep total input under ~8,000 tokens (~32,000 chars) to stay safely under the client timeout. Faster hardware handles much more — the pre-flight estimator adapts once you\'ve done a few calls and real per-model timings are in the SQLite cache.\n\n' +
       'Same review discipline as code_task — verify the output before acting on it.',
     inputSchema: {
       type: 'object' as const,
@@ -1119,6 +1445,24 @@ const TOOLS = [
       required: ['input'],
     },
   },
+  {
+    name: 'stats',
+    description:
+      'Show user stats: tokens offloaded, calls made, per-model performance — for the current session AND ' +
+      'lifetime (persisted in SQLite at ~/.houtini-lm/model-cache.db). Unlike `discover` which includes the ' +
+      'model catalog, `stats` returns just the numbers in a compact markdown table — cheap to call repeatedly ' +
+      'to see the 💰 Claude-quota savings counter climb. Useful for quantifying how much work the local model ' +
+      'is genuinely doing, and for noticing when a model\'s reasoning-token ratio is drifting.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        model: {
+          type: 'string',
+          description: 'Optional: filter output to a single model ID. Omit to see all models this workstation has used.',
+        },
+      },
+    },
+  },
 ];
 
 // ── MCP Server ───────────────────────────────────────────────────────
@@ -1133,7 +1477,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.10.0' },
+  { name: 'houtini-lm', version: '2.11.0' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 
@@ -1371,6 +1715,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : '';
 
         const combined = sections.join('\n\n');
+
+        // Pre-flight prefill estimate. Huge inputs can legitimately exceed
+        // the MCP client's ~60s request timeout during prompt processing, and
+        // progress notifications don't reset that timeout on Claude Desktop.
+        // If measured per-model data in the SQLite cache shows this input
+        // would obviously overrun, refuse with a concrete diagnostic so the
+        // caller knows to split or trim instead of waiting for a silent hang.
+        const estimate = estimatePrefill(combined.length, route.modelId);
+        if (estimate.basis === 'measured' && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
+          const prefillRate = Math.round(estimate.prefillTokPerSec);
+          const estSec = Math.round(estimate.estimatedSeconds);
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `Error: estimated prefill time exceeds the ~60s MCP client timeout.\n\n` +
+                `• Input size: ~${estimate.inputTokens.toLocaleString()} tokens across ${successCount} file(s)\n` +
+                `• Measured prefill rate on ${route.modelId}: ~${prefillRate} tok/s (from ${lifetime.modelStats.get(route.modelId)?.ttftCalls ?? 0} prior calls)\n` +
+                `• Estimated prefill: ~${estSec}s (threshold: ${PREFILL_REFUSE_THRESHOLD_SEC}s)\n\n` +
+                `Options: split the files into smaller groups, trim the largest file, or use \`code_task\` with a focused excerpt. ` +
+                `If you know this workstation can handle it, pass fewer files or run the task again when the measured rate improves.`,
+            }],
+            isError: true,
+          };
+        }
+        if (estimate.estimatedSeconds > PREFILL_WARN_THRESHOLD_SEC) {
+          process.stderr.write(
+            `[houtini-lm] Large input warning: ~${estimate.inputTokens} tokens, est prefill ~${Math.round(estimate.estimatedSeconds)}s (${estimate.basis}). Proceeding.\n`,
+          );
+        }
+
         const codeMessages: ChatMessage[] = [
           {
             role: 'system',
@@ -1434,27 +1809,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const ctx = getContextLength(primary);
         const primaryProfile = await getModelProfileAsync(primary);
 
-        const totalOffloaded = session.promptTokens + session.completionTokens;
-        const sessionStats = session.calls > 0
-          ? `\n💰 Claude quota saved this session: ${totalOffloaded.toLocaleString()} tokens across ${session.calls} offloaded call${session.calls === 1 ? '' : 's'}`
+        // Use sessionSummary() so discover matches the footer format and
+        // automatically picks up the lifetime line when the SQLite cache has
+        // cross-session data.
+        const summary = sessionSummary();
+        const sessionStats = session.calls > 0 || lifetime.totalCalls > 0
+          ? `\n${summary}`
           : `\n💰 Claude quota saved this session: 0 tokens — no calls yet. Measured speed for each model will appear here after the first real call.`;
 
         // Measured speed line for the active model. Discover intentionally does
         // not run a synthetic warmup — speed is captured from real tasks, so the
         // numbers reflect actual workload rather than a contrived benchmark.
+        // Shows session stats when this session has measured calls; otherwise
+        // falls back to workstation lifetime stats so Claude sees historical
+        // perf from call 1 instead of "not yet benchmarked".
         const primaryStats = session.modelStats.get(primary.id);
+        const primaryLifetime = lifetime.modelStats.get(primary.id);
         let speedLine = '';
         if (primaryStats && primaryStats.perfCalls > 0) {
           const avgTtft = primaryStats.ttftCalls > 0 ? Math.round(primaryStats.totalTtftMs / primaryStats.ttftCalls) : 0;
           const avgTokSec = (primaryStats.totalTokPerSec / primaryStats.perfCalls).toFixed(1);
-          speedLine = `Measured speed: ${avgTokSec} tok/s · TTFT ${avgTtft}ms (avg over ${primaryStats.perfCalls} call${primaryStats.perfCalls === 1 ? '' : 's'} this session)\n`;
+          speedLine = `Measured speed (session): ${avgTokSec} tok/s · TTFT ${avgTtft}ms (${primaryStats.perfCalls} call${primaryStats.perfCalls === 1 ? '' : 's'})\n`;
+          if (primaryLifetime && primaryLifetime.perfCalls > primaryStats.perfCalls) {
+            const lAvgTtft = primaryLifetime.ttftCalls > 0 ? Math.round(primaryLifetime.totalTtftMs / primaryLifetime.ttftCalls) : 0;
+            const lAvgTokSec = (primaryLifetime.totalTokPerSec / primaryLifetime.perfCalls).toFixed(1);
+            speedLine += `Measured speed (lifetime on this workstation): ${lAvgTokSec} tok/s · TTFT ${lAvgTtft}ms (${primaryLifetime.perfCalls} calls)\n`;
+          }
+        } else if (primaryLifetime && primaryLifetime.perfCalls > 0) {
+          const lAvgTtft = primaryLifetime.ttftCalls > 0 ? Math.round(primaryLifetime.totalTtftMs / primaryLifetime.ttftCalls) : 0;
+          const lAvgTokSec = (primaryLifetime.totalTokPerSec / primaryLifetime.perfCalls).toFixed(1);
+          speedLine = `Measured speed (lifetime on this workstation): ${lAvgTokSec} tok/s · TTFT ${lAvgTtft}ms (${primaryLifetime.perfCalls} calls, last used ${new Date(primaryLifetime.lastUsedAt).toISOString().slice(0, 10)})\n`;
         } else {
           speedLine = `Measured speed: not yet benchmarked — will be captured on the first real call.\n`;
         }
 
+        const backendLabel = getBackend() === 'lmstudio' ? 'LM Studio'
+          : getBackend() === 'ollama' ? 'Ollama'
+          : 'OpenAI-compatible';
+
         let text =
           `Status: ONLINE\n` +
-          `Endpoint: ${LM_BASE_URL}\n` +
+          `Endpoint: ${LM_BASE_URL} (${backendLabel})\n` +
           `Connection latency: ${ms}ms (does not reflect inference speed)\n` +
           `Active model: ${primary.id}\n` +
           `Context window: ${ctx.toLocaleString()} tokens\n` +
@@ -1487,6 +1882,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const avgTtft = stats.ttftCalls > 0 ? Math.round(stats.totalTtftMs / stats.ttftCalls) : 0;
             const avgTokSec = stats.perfCalls > 0 ? (stats.totalTokPerSec / stats.perfCalls).toFixed(1) : '?';
             text += `  ${modelId}: ${stats.calls} calls, avg TTFT ${avgTtft}ms, avg ${avgTokSec} tok/s\n`;
+          }
+        }
+
+        // Workstation lifetime stats — built from SQLite, persists across restarts.
+        // Only shown when there's lifetime data beyond this session, so a first-run
+        // user doesn't see a duplicate of the session block above.
+        const hasLifetimeBeyondSession = Array.from(lifetime.modelStats.entries())
+          .some(([id, l]) => l.calls > (session.modelStats.get(id)?.calls ?? 0));
+        if (hasLifetimeBeyondSession) {
+          text += `\nPerformance (lifetime on this workstation):\n`;
+          for (const [modelId, stats] of lifetime.modelStats) {
+            const avgTtft = stats.ttftCalls > 0 ? Math.round(stats.totalTtftMs / stats.ttftCalls) : 0;
+            const avgTokSec = stats.perfCalls > 0 ? (stats.totalTokPerSec / stats.perfCalls).toFixed(1) : '?';
+            const lastUsed = new Date(stats.lastUsedAt).toISOString().slice(0, 10);
+            text += `  ${modelId}: ${stats.calls} calls, avg TTFT ${avgTtft}ms, avg ${avgTokSec} tok/s (last used ${lastUsed})\n`;
           }
         }
 
@@ -1569,6 +1979,95 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
       }
 
+      case 'stats': {
+        const { model: filterModel } = args as { model?: string };
+
+        const backendLabel = getBackend() === 'lmstudio' ? 'LM Studio'
+          : getBackend() === 'ollama' ? 'Ollama'
+          : 'OpenAI-compatible';
+
+        const lines: string[] = [];
+        lines.push(`## Houtini LM stats`);
+        lines.push('');
+        lines.push(`**Endpoint**: ${LM_BASE_URL} (${backendLabel})`);
+        if (lifetime.firstSeenAt) {
+          lines.push(`**First call on this workstation**: ${new Date(lifetime.firstSeenAt).toISOString().slice(0, 10)}`);
+        }
+        lines.push('');
+
+        // Totals block
+        lines.push(`### Totals`);
+        lines.push('');
+        lines.push(`| Scope    | Calls | Prompt tokens | Completion tokens | Total tokens |`);
+        lines.push(`|----------|------:|--------------:|------------------:|-------------:|`);
+        lines.push(`| Session  | ${session.calls} | ${session.promptTokens.toLocaleString()} | ${session.completionTokens.toLocaleString()} | ${(session.promptTokens + session.completionTokens).toLocaleString()} |`);
+        lines.push(`| Lifetime | ${lifetime.totalCalls} | — | — | ${lifetime.totalTokens.toLocaleString()} |`);
+        lines.push('');
+
+        // Per-model block (union of session + lifetime model ids)
+        const modelIds = new Set<string>([
+          ...session.modelStats.keys(),
+          ...lifetime.modelStats.keys(),
+        ]);
+        const filtered = filterModel ? [...modelIds].filter((m) => m === filterModel) : [...modelIds];
+
+        if (filtered.length > 0) {
+          lines.push(`### Per-model performance`);
+          lines.push('');
+          lines.push(`| Model | Scope | Calls | Avg TTFT (ms) | Avg tok/s | Prompt tokens | Last used |`);
+          lines.push(`|-------|-------|------:|--------------:|----------:|--------------:|-----------|`);
+          for (const modelId of filtered.sort()) {
+            const s = session.modelStats.get(modelId);
+            const l = lifetime.modelStats.get(modelId);
+            if (s) {
+              const avgTtft = s.ttftCalls > 0 ? Math.round(s.totalTtftMs / s.ttftCalls) : '—';
+              const avgTokSec = s.perfCalls > 0 ? (s.totalTokPerSec / s.perfCalls).toFixed(1) : '—';
+              lines.push(`| ${modelId} | session | ${s.calls} | ${avgTtft} | ${avgTokSec} | — | — |`);
+            }
+            if (l) {
+              const avgTtft = l.ttftCalls > 0 ? Math.round(l.totalTtftMs / l.ttftCalls) : '—';
+              const avgTokSec = l.perfCalls > 0 ? (l.totalTokPerSec / l.perfCalls).toFixed(1) : '—';
+              const lastUsed = new Date(l.lastUsedAt).toISOString().slice(0, 10);
+              lines.push(`| ${modelId} | lifetime | ${l.calls} | ${avgTtft} | ${avgTokSec} | ${l.totalPromptTokens.toLocaleString()} | ${lastUsed} |`);
+            }
+          }
+          lines.push('');
+        } else if (filterModel) {
+          lines.push(`No history for model: \`${filterModel}\`. Try \`list_models\` to see what's been used.`);
+          lines.push('');
+        } else {
+          lines.push(`No calls yet — delegate a task via \`chat\`, \`custom_prompt\`, \`code_task\`, or \`code_task_files\` to start building stats.`);
+          lines.push('');
+        }
+
+        // Reasoning-token diagnostic (lifetime only — needs persistence to be meaningful)
+        if (!filterModel) {
+          // Sum reasoning tokens across all models. We store this per-model
+          // in SQLite but not in the in-memory mirror, so fetch on demand.
+          try {
+            const rows = await getAllPerformance();
+            const totalReasoning = rows.reduce((sum, r) => sum + (r.totalReasoningTokens || 0), 0);
+            const totalCompletion = rows.reduce((sum, r) => sum + r.totalCompletionTokens, 0);
+            if (totalCompletion > 0) {
+              const pct = ((totalReasoning / totalCompletion) * 100).toFixed(1);
+              lines.push(`### Reasoning-token overhead (lifetime)`);
+              lines.push('');
+              lines.push(`${totalReasoning.toLocaleString()} / ${totalCompletion.toLocaleString()} completion tokens spent on hidden reasoning (${pct}% of generation budget). ` +
+                (parseFloat(pct) > 30
+                  ? `**High** — consider loading a non-thinking model, or check that \`reasoning_effort\` is being honoured (see stderr logs).`
+                  : parseFloat(pct) > 10
+                    ? `Moderate — normal for thinking-model families.`
+                    : `Low — reasoning is effectively suppressed.`));
+              lines.push('');
+            }
+          } catch { /* best-effort — don't fail the tool call */ }
+        }
+
+        lines.push(`*Stats persist across restarts in \`~/.houtini-lm/model-cache.db\`.*`);
+
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1590,6 +2089,13 @@ async function main() {
   listModelsRaw()
     .then((models) => profileModelsAtStartup(models))
     .catch((err) => process.stderr.write(`[houtini-lm] Startup profiling skipped: ${err}\n`));
+
+  // Hydrate the in-memory lifetime mirror from SQLite so the very first
+  // tool call this session shows historical savings + per-model perf.
+  // Non-blocking too; the footer degrades to session-only if this fails.
+  hydrateLifetimeFromDb().catch((err) =>
+    process.stderr.write(`[houtini-lm] Lifetime hydration skipped: ${err}\n`),
+  );
 }
 
 main().catch((error) => {
