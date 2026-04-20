@@ -47,7 +47,7 @@ const session = {
   promptTokens: 0,
   completionTokens: 0,
   /** Per-model performance tracking for routing insights */
-  modelStats: new Map<string, { calls: number; perfCalls: number; totalTtftMs: number; totalTokPerSec: number }>(),
+  modelStats: new Map<string, { calls: number; ttftCalls: number; perfCalls: number; totalTtftMs: number; totalTokPerSec: number }>(),
 };
 
 function recordUsage(resp: StreamingResult) {
@@ -61,9 +61,12 @@ function recordUsage(resp: StreamingResult) {
   }
   // Track per-model perf stats
   if (resp.model) {
-    const existing = session.modelStats.get(resp.model) || { calls: 0, perfCalls: 0, totalTtftMs: 0, totalTokPerSec: 0 };
+    const existing = session.modelStats.get(resp.model) || { calls: 0, ttftCalls: 0, perfCalls: 0, totalTtftMs: 0, totalTokPerSec: 0 };
     existing.calls++;
-    if (resp.ttftMs) existing.totalTtftMs += resp.ttftMs;
+    if (resp.ttftMs) {
+      existing.totalTtftMs += resp.ttftMs;
+      existing.ttftCalls++;
+    }
     const tokPerSec = resp.usage && resp.generationMs > 50
       ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
       : 0;
@@ -886,20 +889,19 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
   if (qualityLine) parts.push(qualityLine);
   if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
 
-  if (parts.length === 0) return '';
+  const benchmarkLine = isFirstBenchmarkedCall(resp.model, tokPerSec)
+    ? `📊 First measured call on ${resp.model}: ${tokPerSec.toFixed(1)} tok/s${resp.ttftMs !== undefined ? `, ${resp.ttftMs}ms to first token` : ''} — use this to gauge whether to delegate longer tasks.`
+    : '';
+  const sessionLine = sessionSummary();
 
-  const lines: string[] = [`\n\n---\n${parts.join(' | ')}`];
+  if (parts.length === 0 && !benchmarkLine && !sessionLine) return '';
 
+  const lines: string[] = [`\n\n---${parts.length > 0 ? `\n${parts.join(' | ')}` : ''}`];
   // First-call speed benchmark — surfaced once per model per session, based on
   // the real task just completed (not a synthetic warmup). Gives Claude honest
   // speed data to calibrate future delegation decisions.
-  if (isFirstBenchmarkedCall(resp.model, tokPerSec)) {
-    const ttftStr = resp.ttftMs !== undefined ? `, ${resp.ttftMs}ms to first token` : '';
-    lines.push(`📊 First measured call on ${resp.model}: ${tokPerSec.toFixed(1)} tok/s${ttftStr} — use this to gauge whether to delegate longer tasks.`);
-  }
-
+  if (benchmarkLine) lines.push(benchmarkLine);
   // Session savings — on its own line so it reads as value, not as accounting.
-  const sessionLine = sessionSummary();
   if (sessionLine) lines.push(sessionLine);
 
   return lines.join('\n');
@@ -1158,7 +1160,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     for (const [modelId, stats] of session.modelStats) {
       modelStats[modelId] = {
         calls: stats.calls,
-        avgTtftMs: stats.calls > 0 ? Math.round(stats.totalTtftMs / stats.calls) : 0,
+        avgTtftMs: stats.ttftCalls > 0 ? Math.round(stats.totalTtftMs / stats.ttftCalls) : 0,
         avgTokPerSec: stats.perfCalls > 0 ? parseFloat((stats.totalTokPerSec / stats.perfCalls).toFixed(1)) : null,
       };
     }
@@ -1443,7 +1445,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const primaryStats = session.modelStats.get(primary.id);
         let speedLine = '';
         if (primaryStats && primaryStats.perfCalls > 0) {
-          const avgTtft = primaryStats.calls > 0 ? Math.round(primaryStats.totalTtftMs / primaryStats.calls) : 0;
+          const avgTtft = primaryStats.ttftCalls > 0 ? Math.round(primaryStats.totalTtftMs / primaryStats.ttftCalls) : 0;
           const avgTokSec = (primaryStats.totalTokPerSec / primaryStats.perfCalls).toFixed(1);
           speedLine = `Measured speed: ${avgTokSec} tok/s · TTFT ${avgTtft}ms (avg over ${primaryStats.perfCalls} call${primaryStats.perfCalls === 1 ? '' : 's'} this session)\n`;
         } else {
@@ -1482,7 +1484,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (session.modelStats.size > 0) {
           text += `\n\nPerformance (this session):\n`;
           for (const [modelId, stats] of session.modelStats) {
-            const avgTtft = stats.calls > 0 ? Math.round(stats.totalTtftMs / stats.calls) : 0;
+            const avgTtft = stats.ttftCalls > 0 ? Math.round(stats.totalTtftMs / stats.ttftCalls) : 0;
             const avgTokSec = stats.perfCalls > 0 ? (stats.totalTokPerSec / stats.perfCalls).toFixed(1) : '?';
             text += `  ${modelId}: ${stats.calls} calls, avg TTFT ${avgTtft}ms, avg ${avgTokSec} tok/s\n`;
           }

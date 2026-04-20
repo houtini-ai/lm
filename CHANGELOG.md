@@ -14,6 +14,8 @@
 
 ### Fixed
 - **Streaming reader cleanup on abrupt disconnect** — the `finally` block now races `reader.cancel()` against a 500ms timer before `releaseLock()`, so abrupt client disconnects free the upstream socket sooner without blocking the tool response path. Previously `releaseLock()` alone could leave a wedged upstream connection until the per-chunk timeout fired.
+- **Average TTFT denominator** — per-model `avgTtftMs` (in `discover`, the `houtini://metrics/session` resource, and the session performance block) now divides `totalTtftMs` by a dedicated `ttftCalls` counter rather than `calls`. Previously, calls that reported no TTFT still counted toward the divisor, under-reporting the average. Surfaced by the new prominent speed line in `discover`.
+- **Footer no longer swallows session line when `parts` is empty** — if every other footer field is absent but the session savings line or first-call benchmark exists, the footer now renders those instead of returning an empty string.
 
 ## [2.9.0] - 2026-04-16
 
