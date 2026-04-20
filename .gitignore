@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .claude/
+CLAUDE.md
 memory/
 MEMORY.md
 .env

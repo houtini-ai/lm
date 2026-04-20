@@ -22,6 +22,7 @@ shakedown.mjs
 .vscode/
 .idea/
 .claude/
+CLAUDE.md
 memory/
 MEMORY.md
 .DS_Store
