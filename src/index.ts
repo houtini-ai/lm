@@ -24,6 +24,9 @@ import {
   recordPerformance,
   getAllPerformance,
   getLifetimeTotals,
+  recordPrefillSample,
+  getPrefillSamples,
+  fitPrefillLinear,
   type PromptHints,
 } from './model-cache.js';
 import { readFile } from 'node:fs/promises';
@@ -170,6 +173,15 @@ function recordUsage(resp: StreamingResult) {
     }).catch((err) => {
       process.stderr.write(`[houtini-lm] Performance write failed (continuing): ${err}\n`);
     });
+
+    // Record (prompt_tokens, TTFT) pair for the linear-fit prefill estimator.
+    // Only meaningful when both values are real (we have actual usage and a
+    // measured TTFT). Fire-and-forget alongside recordPerformance.
+    if (resp.ttftMs && promptTokens > 0) {
+      recordPrefillSample(resp.model, promptTokens, resp.ttftMs).catch((err) => {
+        process.stderr.write(`[houtini-lm] Prefill sample write failed (continuing): ${err}\n`);
+      });
+    }
   }
 }
 
@@ -996,40 +1008,67 @@ const PREFILL_WARN_THRESHOLD_SEC = 25;
 interface PrefillEstimate {
   inputTokens: number;
   estimatedSeconds: number;
-  prefillTokPerSec: number;
-  basis: 'measured' | 'default';
+  /** Description of which method produced the estimate. */
+  basis: 'linear-fit' | 'ratio' | 'default';
+  /** Linear fit stats when basis === 'linear-fit'. */
+  fit?: { alphaMs: number; betaMsPerToken: number; r2: number; n: number };
+  /** Ratio rate when basis === 'ratio' (fallback). */
+  prefillTokPerSec?: number;
 }
 
 /**
- * Estimate how long prompt prefill will take, using measured per-model data
- * from the SQLite cache when available. `totalTtftMs` is very close to pure
- * prefill time for a streaming call (first-content-delta arrives right after
- * prefill finishes), so `totalPromptTokens / totalTtftMs` gives a usable
- * prefill-tok/s rate for that specific (model, hardware) pair.
+ * Estimate prompt prefill time. Preferred method is a linear regression
+ * `TTFT ≈ α + β·prompt_tokens` over recent per-model samples — this separates
+ * fixed per-request overhead (α) from genuine per-token prefill cost (β) and
+ * avoids the under-prediction that a ratio-of-averages estimator produces
+ * when the current input is much larger than the historical mean.
+ *
+ * Falls back to the ratio estimator when we have fewer than
+ * PREFILL_FIT_MIN_SAMPLES points, and to a conservative default
+ * (DEFAULT_PREFILL_TOK_PER_SEC) when no measured data exists at all.
  */
-function estimatePrefill(inputChars: number, modelId: string): PrefillEstimate {
+async function estimatePrefill(inputChars: number, modelId: string): Promise<PrefillEstimate> {
   const inputTokens = Math.ceil(inputChars / CHARS_PER_TOKEN);
-  const stats = lifetime.modelStats.get(modelId);
-  let prefillTokPerSec = DEFAULT_PREFILL_TOK_PER_SEC;
-  let basis: 'measured' | 'default' = 'default';
 
+  // 1. Linear fit over recent samples (preferred).
+  try {
+    const samples = await getPrefillSamples(modelId);
+    const fit = fitPrefillLinear(samples);
+    if (fit) {
+      const estimatedMs = Math.max(0, fit.alphaMs + fit.betaMsPerToken * inputTokens);
+      return {
+        inputTokens,
+        estimatedSeconds: estimatedMs / 1000,
+        basis: 'linear-fit',
+        fit,
+      };
+    }
+  } catch {
+    // Sample fetch failed — fall through to ratio estimator
+  }
+
+  // 2. Ratio fallback — uses aggregate stats already in memory.
+  const stats = lifetime.modelStats.get(modelId);
   if (stats && stats.ttftCalls >= 2 && stats.totalTtftMs > 0 && stats.totalPromptTokens > 0) {
-    // Only trust measured data after >=2 TTFT samples — single samples on a
-    // cold model run are noisy. Average prompt tokens per call approximated
-    // as totalPromptTokens / calls, then divided by average TTFT seconds.
     const avgPromptTokens = stats.totalPromptTokens / stats.calls;
     const avgTtftSec = (stats.totalTtftMs / stats.ttftCalls) / 1000;
     if (avgTtftSec > 0) {
-      prefillTokPerSec = avgPromptTokens / avgTtftSec;
-      basis = 'measured';
+      const prefillTokPerSec = avgPromptTokens / avgTtftSec;
+      return {
+        inputTokens,
+        estimatedSeconds: inputTokens / prefillTokPerSec,
+        basis: 'ratio',
+        prefillTokPerSec,
+      };
     }
   }
 
+  // 3. Conservative default for unknown model/hardware.
   return {
     inputTokens,
-    estimatedSeconds: inputTokens / prefillTokPerSec,
-    prefillTokPerSec,
-    basis,
+    estimatedSeconds: inputTokens / DEFAULT_PREFILL_TOK_PER_SEC,
+    basis: 'default',
+    prefillTokPerSec: DEFAULT_PREFILL_TOK_PER_SEC,
   };
 }
 
@@ -1477,7 +1516,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.11.0' },
+  { name: 'houtini-lm', version: '2.11.1' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 
@@ -1722,17 +1761,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // If measured per-model data in the SQLite cache shows this input
         // would obviously overrun, refuse with a concrete diagnostic so the
         // caller knows to split or trim instead of waiting for a silent hang.
-        const estimate = estimatePrefill(combined.length, route.modelId);
-        if (estimate.basis === 'measured' && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
-          const prefillRate = Math.round(estimate.prefillTokPerSec);
+        //
+        // Preferred method: linear fit `TTFT ≈ α + β·prompt_tokens` over the
+        // most recent PREFILL_SAMPLES_PER_MODEL (prompt_tokens, TTFT_ms) pairs.
+        // Separates fixed per-request overhead from per-token prefill cost and
+        // avoids the under-prediction a ratio-of-averages produces on inputs
+        // much larger than the historical mean.
+        const estimate = await estimatePrefill(combined.length, route.modelId);
+        const isConfidentEstimate = estimate.basis === 'linear-fit' || estimate.basis === 'ratio';
+        if (isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
           const estSec = Math.round(estimate.estimatedSeconds);
+          const basisLine = estimate.basis === 'linear-fit'
+            ? `• Estimator: linear fit — TTFT ≈ ${Math.round(estimate.fit!.alphaMs)}ms + ${estimate.fit!.betaMsPerToken.toFixed(2)}ms/token (n=${estimate.fit!.n}, R²=${estimate.fit!.r2.toFixed(2)})`
+            : `• Estimator: ratio fallback — ~${Math.round(estimate.prefillTokPerSec!)} tok/s (from ${lifetime.modelStats.get(route.modelId)?.ttftCalls ?? 0} prior calls; less accurate for inputs far from the historical mean)`;
           return {
             content: [{
               type: 'text',
               text:
                 `Error: estimated prefill time exceeds the ~60s MCP client timeout.\n\n` +
                 `• Input size: ~${estimate.inputTokens.toLocaleString()} tokens across ${successCount} file(s)\n` +
-                `• Measured prefill rate on ${route.modelId}: ~${prefillRate} tok/s (from ${lifetime.modelStats.get(route.modelId)?.ttftCalls ?? 0} prior calls)\n` +
+                `${basisLine}\n` +
                 `• Estimated prefill: ~${estSec}s (threshold: ${PREFILL_REFUSE_THRESHOLD_SEC}s)\n\n` +
                 `Options: split the files into smaller groups, trim the largest file, or use \`code_task\` with a focused excerpt. ` +
                 `If you know this workstation can handle it, pass fewer files or run the task again when the measured rate improves.`,
@@ -1741,8 +1789,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
         if (estimate.estimatedSeconds > PREFILL_WARN_THRESHOLD_SEC) {
+          const basisDetail = estimate.basis === 'linear-fit'
+            ? `linear-fit n=${estimate.fit!.n} R²=${estimate.fit!.r2.toFixed(2)}`
+            : estimate.basis;
           process.stderr.write(
-            `[houtini-lm] Large input warning: ~${estimate.inputTokens} tokens, est prefill ~${Math.round(estimate.estimatedSeconds)}s (${estimate.basis}). Proceeding.\n`,
+            `[houtini-lm] Large input warning: ~${estimate.inputTokens} tokens, est prefill ~${Math.round(estimate.estimatedSeconds)}s (${basisDetail}). Proceeding.\n`,
           );
         }
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.11.1] - 2026-04-20
+
+### Changed
+- **Pre-flight estimator now uses ordinary-least-squares linear regression** over the most recent 100 `(prompt_tokens, TTFT_ms)` samples per model. Fits `TTFT ≈ α + β·prompt_tokens` so fixed per-request overhead (α) is separated from genuine per-token prefill cost (β). The previous ratio-of-averages estimator (`totalPromptTokens / totalTtftMs`) systematically under-predicted for inputs much larger than the historical mean because small-prompt TTFT is dominated by the α term. Verified against real data: a mixed-size sample set containing one 6,955-token call and six ≤230-token calls fits α=668ms, β=1.49ms/token (R²=0.999); predicts 7,000-token TTFT as 11.1s, matching the observed 11.0s within 1%. Falls back to the ratio estimator when fewer than 5 samples exist, then to a conservative default for unknown models.
+
+### Added
+- **`model_prefill_samples` SQLite table** — stores individual `(prompt_tokens, ttft_ms)` observations per model. Capped at 100 samples per model with oldest-first pruning on each insert. Written fire-and-forget alongside `model_performance` so a DB hiccup never stalls a tool response.
+- **`fitPrefillLinear()`** in `model-cache.ts` — reusable OLS implementation exposed so the `shakedown.mjs` script and any future consumers can reason about prefill characteristics of the workstation.
+- **Richer refuse diagnostic** — when `code_task_files` refuses a too-large input, the error message now shows whether the estimate came from the linear fit (with α, β, R², n) or the ratio fallback, so the caller can judge confidence in the refusal.
+
 ## [2.11.0] - 2026-04-20
 
 ### Added

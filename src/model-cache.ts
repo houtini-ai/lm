@@ -259,6 +259,21 @@ export async function initDb(): Promise<Database> {
     )
   `);
 
+  // Per-call prefill samples — used by the linear-fit pre-flight estimator.
+  // Stores (prompt_tokens, TTFT_ms) pairs so we can fit TTFT ≈ α + β·tokens
+  // and separate fixed per-request overhead from real per-token prefill cost.
+  // Capped at PREFILL_SAMPLES_PER_MODEL rows per model; oldest pruned on insert.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS model_prefill_samples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      model_id TEXT NOT NULL,
+      prompt_tokens INTEGER NOT NULL,
+      ttft_ms INTEGER NOT NULL,
+      recorded_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_prefill_samples_model ON model_prefill_samples(model_id, recorded_at DESC)`);
+
   return db;
 }
 
@@ -950,4 +965,141 @@ export async function recordPerformance(
     );
   }
   saveDb();
+}
+
+// ── Prefill sample collection (linear-fit estimator) ─────────────────
+//
+// A ratio-of-averages prefill estimator (totalPromptTokens / totalTtftMs)
+// systematically under-predicts for inputs much larger than the historical
+// mean, because small-prompt TTFT is dominated by fixed per-request overhead
+// rather than per-token prefill compute. Storing individual samples and
+// fitting `TTFT ≈ α + β·prompt_tokens` separates the two components.
+
+/** Max number of samples we retain per model. Older samples are pruned on insert. */
+export const PREFILL_SAMPLES_PER_MODEL = 100;
+
+/** Minimum number of samples before the linear fit is considered reliable. */
+export const PREFILL_FIT_MIN_SAMPLES = 5;
+
+export interface PrefillSample {
+  promptTokens: number;
+  ttftMs: number;
+  recordedAt: number;
+}
+
+/**
+ * Record a single prefill observation. Caller should fire-and-forget.
+ * Automatically prunes the oldest samples beyond PREFILL_SAMPLES_PER_MODEL
+ * so the table doesn't grow unboundedly.
+ */
+export async function recordPrefillSample(
+  modelId: string,
+  promptTokens: number,
+  ttftMs: number,
+): Promise<void> {
+  if (!modelId || promptTokens <= 0 || ttftMs <= 0) return;
+  const database = await initDb();
+  const now = Date.now();
+
+  database.run(
+    `INSERT INTO model_prefill_samples (model_id, prompt_tokens, ttft_ms, recorded_at)
+     VALUES (?, ?, ?, ?)`,
+    [modelId, promptTokens, ttftMs, now],
+  );
+
+  // Prune oldest samples beyond the cap for this model.
+  database.run(
+    `DELETE FROM model_prefill_samples
+     WHERE model_id = ?
+       AND id NOT IN (
+         SELECT id FROM model_prefill_samples
+         WHERE model_id = ?
+         ORDER BY recorded_at DESC
+         LIMIT ?
+       )`,
+    [modelId, modelId, PREFILL_SAMPLES_PER_MODEL],
+  );
+
+  saveDb();
+}
+
+/**
+ * Fetch the most recent N prefill samples for a model (oldest-first so the
+ * caller can fit in whichever order feels right).
+ */
+export async function getPrefillSamples(modelId: string, limit: number = PREFILL_SAMPLES_PER_MODEL): Promise<PrefillSample[]> {
+  if (!modelId) return [];
+  const database = await initDb();
+  const stmt = database.prepare(
+    `SELECT prompt_tokens, ttft_ms, recorded_at
+     FROM model_prefill_samples
+     WHERE model_id = ?
+     ORDER BY recorded_at DESC
+     LIMIT ?`,
+  );
+  const results: PrefillSample[] = [];
+  try {
+    stmt.bind([modelId, limit]);
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as Record<string, unknown>;
+      results.push({
+        promptTokens: row.prompt_tokens as number,
+        ttftMs: row.ttft_ms as number,
+        recordedAt: row.recorded_at as number,
+      });
+    }
+  } finally {
+    stmt.free();
+  }
+  // Reverse so caller gets oldest-first (monotonic recordedAt).
+  return results.reverse();
+}
+
+export interface PrefillFit {
+  /** Fixed per-request overhead (intercept, ms). */
+  alphaMs: number;
+  /** Per-prompt-token cost (slope, ms/token). */
+  betaMsPerToken: number;
+  /** Coefficient of determination — how well the line fits the data. */
+  r2: number;
+  /** Number of samples used. */
+  n: number;
+}
+
+/**
+ * Ordinary-least-squares linear regression: ttft_ms ≈ α + β·prompt_tokens.
+ * Returns null when there are too few samples or zero variance in the inputs
+ * (e.g. every sample happened to have the same prompt size).
+ */
+export function fitPrefillLinear(samples: PrefillSample[]): PrefillFit | null {
+  const n = samples.length;
+  if (n < PREFILL_FIT_MIN_SAMPLES) return null;
+
+  let sumX = 0, sumY = 0;
+  for (const s of samples) {
+    sumX += s.promptTokens;
+    sumY += s.ttftMs;
+  }
+  const meanX = sumX / n;
+  const meanY = sumY / n;
+
+  let num = 0, denX = 0, denY = 0;
+  for (const s of samples) {
+    const dx = s.promptTokens - meanX;
+    const dy = s.ttftMs - meanY;
+    num += dx * dy;
+    denX += dx * dx;
+    denY += dy * dy;
+  }
+
+  // Zero variance in X — every sample was the same prompt size. Can't fit
+  // a meaningful slope; caller should fall back to the simpler estimator.
+  if (denX <= 0) return null;
+
+  const beta = num / denX;
+  const alpha = meanY - beta * meanX;
+  // R² via sum-of-squares. Falls back to 0 when denY=0 (all-same TTFTs, rare).
+  const r2 = denY > 0 ? (num * num) / (denX * denY) : 0;
+
+  return { alphaMs: alpha, betaMsPerToken: beta, r2, n };
 }
