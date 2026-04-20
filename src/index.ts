@@ -946,7 +946,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Default 2048. Use higher for code generation, lower for quick answers.',
+          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384). Pass a number to cap it tighter for quick answers.',
         },
         json_schema: {
           type: 'object',
@@ -993,7 +993,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Default 2048.',
+          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384).',
         },
         json_schema: {
           type: 'object',
@@ -1036,7 +1036,7 @@ const TOOLS = [
         },
         max_tokens: {
           type: 'number',
-          description: 'Max response tokens. Default 2048.',
+          description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384).',
         },
       },
       required: ['code', 'task'],
