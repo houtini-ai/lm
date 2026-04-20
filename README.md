@@ -16,7 +16,7 @@
 
 I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need Claude's reasoning or tool access.
 
-Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-compatible API. Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to whatever cheaper model you've got running. Free. No rate limits. Private.
+Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-compatible API. Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to whatever cheaper model you've got running. No Claude quota burn. No rate limits. Private. The trade is wall-clock time: local inference is typically 3-30× slower than frontier models, so delegation wins on bounded, self-contained tasks rather than everything.
 
 I wrote a [full walkthrough of why I built this and how I use it day to day](https://houtini.com/how-to-cut-your-claude-code-bill-with-houtini-lm/).
 
@@ -147,9 +147,13 @@ The tool descriptions are written to nudge Claude into planning delegation at th
 Every response includes a footer with real performance data - computed from the SSE stream, not from any proprietary API:
 
 ```
+---
 Model: zai-org/glm-4.7-flash | 125->430 tokens | TTFT: 678ms, 48.7 tok/s, 12.5s
-Session: 8,450 tokens offloaded across 14 calls
+📊 First measured call on zai-org/glm-4.7-flash: 48.7 tok/s, 678ms to first token — use this to gauge whether to delegate longer tasks.
+💰 Claude quota saved this session: 8,450 tokens across 14 offloaded calls
 ```
+
+The 📊 line only appears on the first measured call per model per session — it's a real benchmark from a genuine task, not a synthetic warmup. The 💰 line updates every call.
 
 The `discover` tool shows per-model averages across the session:
 
@@ -180,7 +184,7 @@ The workhorse. Send a task, get an answer. The description includes planning tri
 | `message` | yes | - | The task. Be specific about output format. |
 | `system` | no | - | Persona - "Senior TypeScript dev" not "helpful assistant" |
 | `temperature` | no | 0.3 | 0.1 for code, 0.3 for analysis, 0.7 for creative |
-| `max_tokens` | no | 2048 | Lower for quick answers, higher for generation |
+| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). Pass a number to cap it. |
 | `json_schema` | no | - | Force structured JSON output conforming to a schema |
 
 ### `custom_prompt`
@@ -193,7 +197,7 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 | `system` | no | - | Persona + constraints, under 30 words |
 | `context` | no | - | Complete data to analyse. Never truncate. |
 | `temperature` | no | 0.3 | 0.1 for review, 0.3 for analysis |
-| `max_tokens` | no | 2048 | Match to expected output length |
+| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 | `json_schema` | no | - | Force structured JSON output |
 
 ### `code_task`
@@ -205,7 +209,18 @@ Built for code analysis. Pre-configured system prompt with temperature and outpu
 | `code` | yes | - | Complete source code. Never truncate. |
 | `task` | yes | - | "Find bugs", "Explain this", "Write tests" |
 | `language` | no | - | "typescript", "python", "rust", etc. |
-| `max_tokens` | no | 2048 | Match to expected output length |
+| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
+
+### `code_task_files`
+
+Like `code_task`, but the local LLM reads files directly from disk — source never passes through the MCP client's context window. Use this when reviewing multiple related files, or a single large file that's awkward to paste. Files are read in parallel with `Promise.allSettled`, so one unreadable file doesn't sink the call; failures are surfaced inline with the reason.
+
+| Parameter | Required | Default | What it does |
+|-----------|----------|---------|-------------|
+| `file_paths` | yes | - | Array of absolute paths. Relative paths are rejected. |
+| `task` | yes | - | "Find bugs across these files", "Audit this module" |
+| `language` | no | - | "typescript", "python", "rust", etc. |
+| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 
 ### `embed`
 
@@ -218,7 +233,7 @@ Generate text embeddings via the OpenAI-compatible `/v1/embeddings` endpoint. Re
 
 ### `discover`
 
-Health check. Returns model name, context window, latency, capability profile, and cumulative session stats including per-model performance averages. Call before delegating if you're not sure the LLM's available.
+Health check and speed readout. Returns model name, context window, capability profile, connection latency (labelled explicitly — this is the `/v1/models` fetch round-trip, *not* inference speed), and the active model's measured tok/s and TTFT averaged over the session. Before any real call has run, measured speed shows as "not yet benchmarked — will be captured on the first real call" rather than inventing a number from a synthetic probe. Call before delegating if you're not sure the LLM's available, or when deciding whether a longer task is worth offloading.
 
 ### `list_models`
 
@@ -285,9 +300,9 @@ The quality footer flags `think-blocks-stripped` when stripping occurred, so you
 Every response includes structured quality signals in the footer so Claude (or any orchestrator) can make informed trust decisions:
 
 ```
-Model: qwen3-coder-30b-a3b | 413→81 tokens | TTFT: 2355ms, 15.0 tok/s, 5.4s
-Quality: think-blocks-stripped, tokens-estimated
-Session: 494 tokens offloaded across 1 call
+---
+Model: qwen3-coder-30b-a3b | 413→81 tokens | TTFT: 2355ms, 15.0 tok/s, 5.4s | Quality: think-blocks-stripped, tokens-estimated
+💰 Claude quota saved this session: 494 tokens across 1 offloaded call
 ```
 
 Flags include: `TRUNCATED` (partial result), `think-blocks-stripped`, `tokens-estimated` (usage data was missing, estimated from content length), `hit-max-tokens`. When no flags fire, the quality line is omitted — clean output, nothing to report.
@@ -344,7 +359,7 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 
 ## Streaming and timeouts
 
-All inference uses Server-Sent Events streaming. Tokens arrive incrementally. As of v2.8.0, houtini-lm sends MCP progress notifications on every streamed chunk, which resets the SDK's 60-second client timeout. This means generation can run as long as the model needs — there's no hard ceiling as long as tokens keep flowing.
+All inference uses Server-Sent Events streaming. Tokens arrive incrementally. Since v2.9.0, houtini-lm sends MCP progress notifications on every streamed chunk — including during the thinking phase for reasoning models — which resets the SDK's 60-second client timeout. A 5-minute soft timeout acts as a safety net so a genuinely wedged connection can't hold a tool call open indefinitely; as long as tokens keep flowing, the per-chunk progress keeps the client side alive up to that ceiling.
 
 If the connection stalls (no new tokens for an extended period), you get a partial result instead of a timeout error. The footer shows `TRUNCATED` when this happens, and the quality metadata flags it so Claude knows to treat the output with appropriate caution.
 
