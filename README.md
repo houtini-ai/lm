@@ -1,4 +1,4 @@
-# @houtini/lm Houtini LM - Save Tokens by Offloading Tasks from Claude Code to Your Local LLM Server (LM Studio / Ollama) or a Cloud API
+# @houtini/lm Houtini LM - Save Tokens by Offloading Tasks from Claude Code to Your Local LLM Server (LM Studio / Ollama), Openrouter or a Cloud API
 
 [![npm version](https://img.shields.io/npm/v/@houtini/lm.svg?style=flat-square)](https://www.npmjs.com/package/@houtini/lm)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
