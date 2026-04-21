@@ -592,11 +592,27 @@ async function chatCompletionStreamingInner(
   messages: ChatMessage[],
   options: { temperature?: number; maxTokens?: number; model?: string; responseFormat?: ResponseFormat; progressToken?: string | number } = {},
 ): Promise<StreamingResult> {
+  // Resolve active model once — we use it for both context-aware max_tokens
+  // and for auto-injecting the model field when the caller didn't specify one.
+  // Ollama returns HTTP 400 ("model is required") if the field is absent;
+  // LM Studio accepts an empty field and picks the loaded default. Resolving
+  // eagerly makes the two backends behave identically from the caller's POV.
+  let resolvedModel: string | undefined = options.model || LM_MODEL || undefined;
+  let activeModelCached: ModelInfo | null = null;
+  const resolveActive = async () => {
+    if (activeModelCached === null) activeModelCached = await getActiveModel();
+    return activeModelCached;
+  };
+  if (!resolvedModel) {
+    const active = await resolveActive();
+    if (active) resolvedModel = active.id;
+  }
+
   // Derive max_tokens from the model's actual context window when not explicitly set.
   // Uses 25% of context as a generous output budget (e.g. 262K context → 65K output).
   let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
   if (!options.maxTokens) {
-    const activeModel = await getActiveModel();
+    const activeModel = await resolveActive();
     if (activeModel) {
       const ctx = getContextLength(activeModel);
       effectiveMaxTokens = Math.floor(ctx * 0.25);
@@ -614,8 +630,8 @@ async function chatCompletionStreamingInner(
     stream: true,
     stream_options: { include_usage: true },
   };
-  if (options.model || LM_MODEL) {
-    body.model = options.model || LM_MODEL;
+  if (resolvedModel) {
+    body.model = resolvedModel;
   }
   if (options.responseFormat) {
     body.response_format = options.responseFormat;
@@ -636,7 +652,7 @@ async function chatCompletionStreamingInner(
   // silently fall back to 'on' — maximising reasoning, the OPPOSITE of intent.
   // Hence the family-specific mapping below. When uncertain, we omit the
   // field entirely rather than risk a bad-value fallback.
-  const modelId = (options.model || LM_MODEL || '').toString();
+  const modelId = (resolvedModel || '').toString();
   if (modelId) {
     const thinking = await getThinkingSupport(modelId);
     if (thinking?.supportsThinkingToggle) {
@@ -757,13 +773,21 @@ async function chatCompletionStreamingInner(
 
           const delta = json.choices?.[0]?.delta;
 
-          // Reasoning channel. LM Studio (with "Separate reasoning_content"
-          // dev setting), DeepSeek R1, Ollama OpenAI-compat, Nemotron etc.
-          // stream reasoning via delta.reasoning_content — we MUST capture it
-          // so the safety net below can return something when the model
-          // burns its entire budget before emitting a single content token.
-          if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
-            reasoning += delta.reasoning_content;
+          // Reasoning channel. Two field names exist in the wild:
+          //   - LM Studio (dev toggle "Separate reasoning_content"), DeepSeek R1,
+          //     Nemotron       → delta.reasoning_content
+          //   - Ollama OpenAI-compat (all thinking models)       → delta.reasoning
+          // We capture both so runtime detection and safety-net fallback fire
+          // regardless of backend. An Ollama qwen3:4b at low max_tokens
+          // previously looked like a broken model — silent empty content —
+          // because this channel was dropped.
+          const reasoningChunk = (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0)
+            ? delta.reasoning_content
+            : (typeof delta?.reasoning === 'string' && delta.reasoning.length > 0)
+              ? delta.reasoning
+              : '';
+          if (reasoningChunk) {
+            reasoning += reasoningChunk;
             sendProgress(`Thinking... (${reasoning.length} chars of reasoning)`);
           }
 
@@ -793,8 +817,13 @@ async function chatCompletionStreamingInner(
           const json = JSON.parse(trimmed.slice(6));
           if (json.model) model = json.model;
           const delta = json.choices?.[0]?.delta;
-          if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
-            reasoning += delta.reasoning_content;
+          const finalReasoningChunk = (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0)
+            ? delta.reasoning_content
+            : (typeof delta?.reasoning === 'string' && delta.reasoning.length > 0)
+              ? delta.reasoning
+              : '';
+          if (finalReasoningChunk) {
+            reasoning += finalReasoningChunk;
           }
           if (typeof delta?.content === 'string' && delta.content.length > 0) {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
@@ -827,10 +856,16 @@ async function chatCompletionStreamingInner(
   const generationMs = Date.now() - startTime;
 
   // Strip <think>...</think> reasoning blocks from models that always emit them
-  // inline on the content channel (e.g. GLM Flash). Claude doesn't need the
-  // model's internal reasoning. Handle both closed and unclosed blocks.
-  let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');  // closed blocks
-  cleanContent = cleanContent.replace(/^<think>\s*/, '');                   // orphaned opening tag
+  // inline on the content channel (e.g. GLM Flash, Ollama Qwen3). Claude doesn't
+  // need the model's internal reasoning. Handle three shapes:
+  //   1. Balanced  <think>...</think>  — GLM Flash, Nemotron normal case
+  //   2. Orphan opener <think>... (truncated)
+  //   3. Orphan closer ...</think>  — Ollama Qwen3 streams reasoning directly
+  //      on the content channel and terminates with a bare </think> before the
+  //      real answer. Strip everything up to and including the first closer.
+  let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');   // closed blocks
+  cleanContent = cleanContent.replace(/^<think>\s*/, '');                    // orphaned opening tag
+  cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');          // orphaned closing tag
   cleanContent = cleanContent.trim();
 
   // Safety nets for empty visible output. Try in order:
@@ -1516,7 +1551,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.11.1' },
+  { name: 'houtini-lm', version: '2.12.0' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 

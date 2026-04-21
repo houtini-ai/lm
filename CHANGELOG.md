@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.12.0] - 2026-04-21
+
+### Fixed
+- **Ollama `delta.reasoning` capture** — Ollama's OpenAI-compatible streaming emits reasoning on `delta.reasoning`, not `delta.reasoning_content` (which LM Studio uses). The field was silently dropped, so Ollama thinking models like `qwen3:4b` produced empty `content` with `finish_reason=length` at default `max_tokens`. Now captured identically to LM Studio's channel — routing, safety-net fallback, and the `reasoning-only` quality flag all fire for Ollama.
+- **Qwen3 base models detected as thinking-capable** — `qwen3:4b`, `qwen3-8b`, `qwen3-14b-instruct` etc. ship with `enable_thinking=true` hardcoded in their Jinja template (Ollama ignores the API flag). `detectThinkingSupportFromArch()` now flags any `qwen3*` model except coder / VL / embedding variants, so `max_tokens` inflation fires on first call. Previously only `qwen3-thinking`-tagged variants were recognised.
+- **Auto-inject `model` field** — Ollama returns HTTP 400 ("model is required") when the field is absent; LM Studio accepted it and picked the loaded default. Inference path now resolves the active model from the backend before sending, so either backend behaves identically when the caller omits the model.
+
 ## [2.11.1] - 2026-04-20
 
 ### Changed

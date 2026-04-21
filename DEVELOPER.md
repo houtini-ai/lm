@@ -61,17 +61,23 @@ runs. The moving parts, in order:
    `PREFILL_TIMEOUT_MS` (180s) while `firstChunkReceived` is false, then
    switches to `READ_CHUNK_TIMEOUT_MS` (30s) for the rest. Big prefills
    legitimately take 1–2 min; mid-stream stalls should surface faster.
-6. **Delta parsing** — recognises three OpenAI-vendor delta fields:
+6. **Delta parsing** — recognises four OpenAI-vendor delta fields:
    - `delta.content` — visible text, accumulates into `content`
    - `delta.reasoning_content` — hidden reasoning (DeepSeek R1, Nemotron,
      LM Studio's "Separate reasoning_content" dev toggle). Accumulated into
-     a separate `reasoning` buffer. **Must not be discarded** — see the
-     fallback below.
+     the `reasoning` buffer. **Must not be discarded** — see the fallback
+     below.
+   - `delta.reasoning` — same channel, Ollama's naming. Captured into the
+     same `reasoning` buffer. Missing this was a long-standing bug:
+     Ollama thinking models (qwen3:4b, deepseek-r1 etc.) appeared broken
+     because all reasoning tokens were dropped on the floor.
    - `json.usage.completion_tokens_details.reasoning_tokens` — arrives on
      the final usage chunk when `stream_options.include_usage` is set.
-7. **Strip `<think>...</think>`** — in-band reasoning blocks (GLM Flash
-   style) are stripped from `content` after assembly. Both closed blocks
-   and orphaned opening tags are handled.
+7. **Strip `<think>...</think>`** — in-band reasoning blocks are stripped
+   from `content` after assembly. Three shapes are handled: balanced pairs
+   (GLM Flash), orphan openers (truncated responses), and orphan closers
+   (Ollama Qwen3 streams reasoning directly on the content channel and
+   terminates it with a bare `</think>` before the real answer).
 8. **Empty-output safety nets**, tried in order:
    - `thinkStripFallback` — stripping emptied `content` but raw content had
      text. Returns raw content with a `think-strip-empty` quality flag.
@@ -102,7 +108,9 @@ stale cache entries from before the detection list was broadened still pick
 up new flags without a manual refresh.
 
 Families currently recognised as thinking: Gemma 4, Nemotron, DeepSeek R1,
-GLM-4, gpt-oss, Qwen3-thinking, anything tagged `-thinking`.
+GLM-4, gpt-oss, Qwen3 base (any `qwen3*` except coder/VL/embed variants —
+the Jinja template defaults `enable_thinking=true`, which Ollama honours
+regardless of the API flag), Qwen3-thinking, anything tagged `-thinking`.
 
 ## Backend detection
 

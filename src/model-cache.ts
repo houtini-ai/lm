@@ -467,8 +467,17 @@ function detectThinkingSupportFromArch(arch: string, modelId: string): { emitsTh
     /\bthinking\b/i,  // any model tagged "-thinking"
   ];
 
+  // Qwen3 base models (qwen3:4b, qwen3-8b, qwen3-14b-instruct, etc.) ship with
+  // a hybrid chat_template that defaults to enable_thinking=true. Ollama can't
+  // suppress it (template ignores the API flag), so the content channel stays
+  // empty unless max_tokens is inflated. Exclude variants that explicitly
+  // don't reason: coder models, VL (vision), and pure embedders.
+  const isQwen3Reasoning = (/qwen3/i.test(archLower) || /qwen3/i.test(idLower))
+    && !/coder|vl|embed/i.test(archLower + ' ' + idLower);
+
   const isThinking = thinkingArchitectures.some(a => archLower.includes(a))
-    || thinkingIdPatterns.some(p => p.test(idLower));
+    || thinkingIdPatterns.some(p => p.test(idLower))
+    || isQwen3Reasoning;
 
   return {
     emitsThinkBlocks: isThinking,

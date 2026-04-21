@@ -360,13 +360,15 @@ Want a human-readable quality review rather than just latency numbers? Paste [SH
 
 ## Think-block handling
 
-Some models emit `<think>...</think>` reasoning blocks before the actual answer. Houtini-lm handles this in two ways:
+Thinking models burn part of their output budget on invisible reasoning before producing an answer. Left alone, small models at default `max_tokens` will happily spend the whole budget reasoning and return an empty body. Houtini-lm handles this in three ways:
 
-1. **Suppression at source** — at startup, houtini-lm checks each model's HuggingFace chat template for thinking support. Models that support the `enable_thinking` toggle (like Qwen3) get thinking disabled at inference time, reclaiming the generation budget for actual output. This detection is fully automatic — no hardcoded model lists.
+1. **Suppression at source** — at startup, houtini-lm checks each model's HuggingFace chat template for thinking support. Models that support the `enable_thinking` toggle (like Qwen3) get thinking disabled at inference time, reclaiming the generation budget for actual output. Detection is automatic via chat-template inspection plus arch/id heuristics, so Ollama tags like `qwen3:4b` are recognised as thinking-capable too.
 
-2. **Stripping as fallback** — for models that always emit think blocks regardless (GLM Flash, Nemotron), the content is stripped after assembly so Claude gets clean output. Orphaned opening tags from truncated responses are handled too.
+2. **Budget inflation** — when a model is flagged as thinking-capable, `max_tokens` is silently inflated (×4 or +2000, whichever is bigger) so reasoning can't starve the content channel. Essential for backends like Ollama where the Qwen3 Jinja template hardcodes `enable_thinking=true` and ignores the API flag.
 
-The quality footer flags `think-blocks-stripped` when stripping occurred, so you know the model was reasoning internally even though the output is clean.
+3. **Reasoning capture + stripping** — reasoning is captured from both `delta.reasoning_content` (LM Studio, DeepSeek R1, Nemotron) and `delta.reasoning` (Ollama). Inline `<think>...</think>` blocks on the content channel are stripped after assembly — balanced pairs, orphan openers, and orphan closers are all handled. When reasoning exhausts the budget entirely, the captured reasoning text is returned as a last-ditch fallback so the caller sees *something* rather than a silent empty body.
+
+The quality footer flags `think-blocks-stripped` when stripping occurred, `reasoning-only` when the fallback fired, and `hit-max-tokens` when the budget ran out — so you know exactly what happened even when the output looks clean.
 
 ## Quality metadata
 
@@ -422,7 +424,7 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 | What | URL | Notes |
 |------|-----|-------|
 | [LM Studio](https://lmstudio.ai) | `http://localhost:1234` | Default, zero config. Rich metadata via v0 API. |
-| [Ollama](https://ollama.com) | `http://localhost:11434` | Set `LM_STUDIO_URL` |
+| [Ollama](https://ollama.com) | `http://localhost:11434` | Set `LM_STUDIO_URL`. Thinking models (qwen3, deepseek-r1) handled transparently — reasoning is captured from Ollama's `delta.reasoning` channel and the output budget is inflated automatically so small thinking models don't return empty bodies. |
 | [vLLM](https://docs.vllm.ai) | `http://localhost:8000` | Native OpenAI API |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `http://localhost:8080` | Server mode |
 | [DeepSeek](https://platform.deepseek.com) | `https://api.deepseek.com` | 28c/M input tokens |
