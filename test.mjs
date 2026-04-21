@@ -10,6 +10,13 @@
 
 const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 let MODEL = process.env.LM_STUDIO_MODEL || '';
+const API_KEY = process.env.LM_PASSWORD || process.env.OPENROUTER_API_KEY || '';
+
+function authHeaders(extra = {}) {
+  const h = { ...extra };
+  if (API_KEY) h['Authorization'] = `Bearer ${API_KEY}`;
+  return h;
+}
 
 let passed = 0;
 let failed = 0;
@@ -38,7 +45,7 @@ async function chat(messages, opts = {}) {
 
   const res = await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(opts.timeout || 60000),
   });
@@ -57,7 +64,7 @@ console.log(`Target: ${BASE}`);
 console.log('--- Health & Models ---');
 
 await test('List models endpoint', async () => {
-  const res = await fetch(`${BASE}/v1/models`);
+  const res = await fetch(`${BASE}/v1/models`, { headers: authHeaders() });
   const data = await res.json();
   if (!data.data || data.data.length === 0) throw new Error('No models');
   // Auto-detect model if not set
