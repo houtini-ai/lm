@@ -16,7 +16,7 @@
 
 I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need Claude's reasoning or tool access.
 
-Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-compatible API. Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to whatever cheaper model you've got running. No Claude quota burn. No rate limits. Private. The trade is wall-clock time: local inference is typically 3-30× slower than frontier models, so delegation wins on bounded, self-contained tasks rather than everything.
+Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-compatible API (LM Studio, Ollama, vLLM, DeepSeek, Groq, Cerebras, and OpenRouter's 300+ models through one endpoint). Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to whatever cheaper model you've got running. No Claude quota burn. No rate limits. Private if local, cheap if cloud. The trade is wall-clock time: local inference is typically 3-30× slower than frontier models, so delegation wins on bounded, self-contained tasks rather than everything.
 
 I wrote a [full walkthrough of why I built this and how I use it day to day](https://houtini.com/how-to-cut-your-claude-code-bill-with-houtini-lm/).
 
@@ -196,6 +196,15 @@ The routing scores loaded models against the task type (code, chat, analysis, em
 
 Supported model families with curated prompt hints: GLM-4, Qwen3 Coder, Qwen3, LLaMA 3, Nemotron, Granite, GPT-OSS, Nomic Embed. Unknown models get sensible defaults.
 
+### Overriding the router
+
+Scoring works well when there are a handful of loaded models. On providers with large catalogues (OpenRouter lists 300+ models, all reporting as routable) unknown models all score zero and ties break on iteration order, so you probably want to pin explicitly. Two ways, in precedence order:
+
+1. **Per-call** — pass `model: "nvidia/nemotron-3-nano-30b-a3b:free"` to any of `chat` / `custom_prompt` / `code_task` / `code_task_files`. Overrides everything else.
+2. **Per-process** — set `HOUTINI_LM_MODEL` in the environment. Applies to every tool call from that server process. Overridden by the per-call parameter.
+
+Leave both unset and the router picks.
+
 ## Tools
 
 ### `chat`
@@ -209,6 +218,7 @@ The workhorse. Send a task, get an answer. The description includes planning tri
 | `temperature` | no | 0.3 | 0.1 for code, 0.3 for analysis, 0.7 for creative |
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). Pass a number to cap it. |
 | `json_schema` | no | - | Force structured JSON output conforming to a schema |
+| `model` | no | *auto-route* | Pin a specific model id (e.g. `nvidia/nemotron-3-nano-30b-a3b:free` on OpenRouter). Overrides routing and `HOUTINI_LM_MODEL`. Useful on providers with many candidates. |
 
 ### `custom_prompt`
 
@@ -222,6 +232,7 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 | `temperature` | no | 0.3 | 0.1 for review, 0.3 for analysis |
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
 | `json_schema` | no | - | Force structured JSON output |
+| `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 
 ### `code_task`
 
@@ -233,6 +244,7 @@ Built for code analysis. Pre-configured system prompt with temperature and outpu
 | `task` | yes | - | "Find bugs", "Explain this", "Write tests" |
 | `language` | no | - | "typescript", "python", "rust", etc. |
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
+| `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 
 ### `code_task_files`
 
@@ -246,6 +258,7 @@ Includes a **pre-flight prefill estimator**: if measured per-model data from the
 | `task` | yes | - | "Find bugs across these files", "Audit this module" |
 | `language` | no | - | "typescript", "python", "rust", etc. |
 | `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
+| `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 
 ### `embed`
 
@@ -372,13 +385,15 @@ Want a human-readable quality review rather than just latency numbers? Paste [SH
 
 ## Think-block handling
 
-Thinking models burn part of their output budget on invisible reasoning before producing an answer. Left alone, small models at default `max_tokens` will happily spend the whole budget reasoning and return an empty body. Houtini-lm handles this in three ways:
+Thinking models burn part of their output budget on invisible reasoning before producing an answer. Left alone, small models at default `max_tokens` will happily spend the whole budget reasoning and return an empty body. How houtini-lm handles this depends on whether the provider exposes reasoning as a separate channel or in-band.
 
-1. **Suppression at source** — at startup, houtini-lm checks each model's HuggingFace chat template for thinking support. Models that support the `enable_thinking` toggle (like Qwen3) get thinking disabled at inference time, reclaiming the generation budget for actual output. Detection is automatic via chat-template inspection plus arch/id heuristics, so Ollama tags like `qwen3:4b` are recognised as thinking-capable too.
+**Local backends (LM Studio, Ollama, vLLM)** — reasoning arrives inline on the content channel or via `delta.reasoning_content` / `delta.reasoning`:
 
-2. **Budget inflation** — when a model is flagged as thinking-capable, `max_tokens` is silently inflated (×4 or +2000, whichever is bigger) so reasoning can't starve the content channel. Essential for backends like Ollama where the Qwen3 Jinja template hardcodes `enable_thinking=true` and ignores the API flag.
-
+1. **Suppression at source** — at startup, houtini-lm checks each model's HuggingFace chat template for thinking support. Models that support the `enable_thinking` toggle (Qwen3, Gemma 4, Nemotron, DeepSeek R1, GLM-4, gpt-oss) get thinking disabled at inference time. Detection is automatic via chat-template inspection plus arch/id heuristics, so Ollama tags like `qwen3:4b` are recognised too.
+2. **Budget inflation** — `max_tokens` is silently inflated (×4 or +2000, whichever is bigger) so reasoning can't starve the content channel. Essential for backends like Ollama where the Qwen3 Jinja template hardcodes `enable_thinking=true` and ignores the API flag.
 3. **Reasoning capture + stripping** — reasoning is captured from both `delta.reasoning_content` (LM Studio, DeepSeek R1, Nemotron) and `delta.reasoning` (Ollama). Inline `<think>...</think>` blocks on the content channel are stripped after assembly — balanced pairs, orphan openers, and orphan closers are all handled. When reasoning exhausts the budget entirely, the captured reasoning text is returned as a last-ditch fallback so the caller sees *something* rather than a silent empty body.
+
+**OpenRouter** — handles reasoning as a structured per-request parameter and a separate `message.reasoning` response field. Houtini-lm sends `reasoning: { exclude: true }` on every OpenRouter call so thinking models (Nemotron, DeepSeek R1, Qwen3, Claude thinking, gpt-oss, etc.) are normalised to text-only output at the provider level. Budget inflation still fires because some upstream providers bill reasoning tokens against the cap before `exclude` filtering. No stripping is needed — the provider never sends the reasoning in the first place.
 
 The quality footer flags `think-blocks-stripped` when stripping occurred, `reasoning-only` when the fallback fired, and `hit-max-tokens` when the budget ran out — so you know exactly what happened even when the output looks clean.
 
@@ -418,7 +433,9 @@ The `houtini://metrics/session` MCP resource exposes cumulative offload stats as
 
 ## Request serialisation
 
-Parallel MCP tool calls are automatically queued and run one at a time. Most local LLM servers run a single model — without serialisation, parallel requests stack timeouts and waste the generation budget. The semaphore ensures each call gets the full timeout window.
+On **local** providers (LM Studio, Ollama, vLLM, llama.cpp) parallel MCP tool calls are automatically queued and run one at a time. A single-GPU host can only serve one request at a time anyway — without the semaphore, parallel calls stack timeouts and waste the generation budget.
+
+On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything detected as a non-local backend) the semaphore is skipped — the upstream handles parallelism natively and serialising artificially would throttle you. This is automatic; you don't need to configure it.
 
 ## Configuration
 

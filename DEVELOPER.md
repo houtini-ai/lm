@@ -10,11 +10,14 @@ configuration — see [README.md](./README.md).
 ```
 src/
   index.ts            MCP server — tool definitions, request handlers,
-                      streaming, session + lifetime accounting, routing
+                      streaming, session + lifetime accounting, routing,
+                      provider-profile registry
   model-cache.ts      SQLite (sql.js / WASM) — model profiles, thinking-
                       support detection, per-model performance history
 server.json           MCP registry manifest
-test.mjs              Integration tests (requires a live endpoint)
+test.mjs              Direct-client integration tests (hits /v1 endpoints)
+test-mcp-e2e.mjs      End-to-end MCP harness — spawns the built server over
+                      stdio, drives real tool calls, verifies provider paths
 benchmark.mjs         Throughput + savings benchmark
 shakedown.mjs         End-to-end self-test — runs all 7 tools in sequence
 SHAKEDOWN.md          Canonical test prompt (for running via Claude chat)
@@ -45,13 +48,20 @@ runs. The moving parts, in order:
 1. **`max_tokens` sizing** — if the caller didn't specify, derive 25% of the
    active model's context window. Fallback `DEFAULT_MAX_TOKENS` (16384) when
    context size is unknown.
-2. **Reasoning-model gate** — call `getThinkingSupport(modelId)`. If true:
-   - Set `enable_thinking: false` (Qwen3 vendor param)
-   - Set `reasoning_effort` to a backend-appropriate minimum — `'none'` on
-     LM Studio + Ollama, `'low'` on generic OpenAI-compatible (DeepSeek)
-   - **Inflate `max_tokens` 4×** — a safety net in case the backend ignores
-     both flags. Inflation base is `effectiveMaxTokens` (context-aware), not
-     the raw 16k default.
+2. **Reasoning-model gate** — branches on the current provider profile
+   (`getProviderProfile().reasoningStyle`):
+   - `'openrouter-field'` — send `reasoning: { exclude: true }`. OpenRouter
+     normalises thinking output across Nemotron / DeepSeek R1 / Qwen3 /
+     Claude-thinking / gpt-oss and returns clean text content only. Budget
+     still inflated 4× (or +2000) because some upstream providers bill
+     reasoning against the cap before filtering.
+   - `'think-blocks'` (local) — call `getThinkingSupport(modelId)`. If true:
+     set `enable_thinking: false` (Qwen3 vendor param), set
+     `reasoning_effort` to a backend-appropriate minimum (`'none'` on
+     LM Studio + Ollama, `'low'` on generic OpenAI-compatible), and inflate
+     `max_tokens` 4× as a safety net for backends that ignore both flags
+     (Gemma 4 and Qwen3 in Ollama both do). Inflation base is
+     `effectiveMaxTokens` (context-aware), not the raw 16k default.
 3. **Fetch POST** — `fetchWithTimeout(/v1/chat/completions, body, 30s connect)`.
 4. **Prefill keep-alive timer** — `setInterval(PREFILL_KEEPALIVE_MS)` fires a
    `notifications/progress` every 10s until the first chunk arrives. Without
@@ -115,15 +125,40 @@ regardless of the API flag), Qwen3-thinking, anything tagged `-thinking`.
 ## Backend detection
 
 Probed once on first `listModelsRaw()` call, cached in
-`detectedBackend: 'lmstudio' | 'ollama' | 'openai-compat'` for the session.
-Inference always uses `/v1/chat/completions` (portable); the backend flag
-only steers enrichment (richer model metadata, reasoning_effort mapping,
-diagnostic labelling in `discover` output).
+`detectedBackend: 'lmstudio' | 'ollama' | 'openai-compat' | 'openrouter'`
+for the session. Inference always uses `/v1/chat/completions` (portable);
+the backend flag steers enrichment (richer model metadata, reasoning
+handling, attribution headers, retry policy, diagnostic labelling).
 
 Probe order:
-1. `GET /api/v0/models` — LM Studio (richest metadata)
-2. `GET /api/tags` — Ollama (native list, mapped to the `ModelInfo` shape)
-3. `GET /v1/models` — generic (vLLM, DeepSeek, OpenRouter, llama.cpp)
+1. **OpenRouter short-circuit** — if `LM_BASE_URL` matches `openrouter.ai`
+   or `HOUTINI_LM_PROVIDER=openrouter` is set, skip probes and go straight
+   to `GET /v1/models` (which on OpenRouter already returns
+   `context_length` and `architecture.input_modalities`).
+2. `GET /api/v0/models` — LM Studio (richest metadata)
+3. `GET /api/tags` — Ollama (native list, mapped to the `ModelInfo` shape)
+4. `GET /v1/models` — generic (vLLM, DeepSeek, llama.cpp, any other
+   OpenAI-compatible server)
+
+## Provider profiles
+
+`getProviderProfile()` is a small central registry that gates per-backend
+behaviour. Keeps divergence in one place instead of scattered across the
+hot path. Today it has flags for four things:
+
+| Flag | Local (`lmstudio`/`ollama`/`openai-compat`) | `openrouter` |
+|---|---|---|
+| `extraHeaders` | `{}` | `HTTP-Referer`, `X-Title` for attribution |
+| `serialiseInference` | `true` (single-GPU protection) | `false` (upstream handles parallelism) |
+| `retryOnRateLimit` | `false` | `true` (jittered backoff, honours `Retry-After`) |
+| `reasoningStyle` | `'think-blocks'` | `'openrouter-field'` |
+
+Detection is URL-based (`openrouter.ai`) with `HOUTINI_LM_PROVIDER=openrouter`
+as an explicit override for custom domains or self-hosted proxies. The
+`ProviderProfile` interface lives near the top of `src/index.ts` — add flags
+only when a real divergence forces one, not speculatively. Three providers
+is where the abstraction proves its worth; two is still close to "a couple
+of if-statements."
 
 ## SQLite cache — two tables
 
@@ -210,16 +245,33 @@ the side of letting the call run.
 ## Adding a new backend
 
 The portable `/v1/chat/completions` path should work for any
-OpenAI-compatible server with no changes. What varies is:
+OpenAI-compatible server with no changes — set `HOUTINI_LM_ENDPOINT_URL`
+and `HOUTINI_LM_API_KEY` and you're likely done. Only add code when the
+provider has concrete divergence from the generic path.
 
-1. **Model listing** — add a probe to `listModelsRaw()` if the server has
-   a richer native endpoint worth preferring. Set `detectedBackend` to a
-   new string literal if you want backend-specific behaviour elsewhere.
-2. **`reasoning_effort` values** — update `getReasoningEffortValue()` if
-   the new backend accepts a different set.
-3. **Capabilities metadata mapping** — if the native list format doesn't
+When you do need provider-specific behaviour:
+
+1. **Detection** — extend the `Backend` type with the new string literal
+   and teach `listModelsRaw()` to set `detectedBackend` to it. Prefer
+   URL-based auto-detection with an explicit `HOUTINI_LM_PROVIDER` env var
+   as override.
+2. **Provider profile** — add a branch to `getProviderProfile()` for the
+   new backend. Set only the flags that genuinely differ. Don't speculate
+   — if you're unsure whether a flag should be on or off, leave it at the
+   default and let the first real usage show you.
+3. **Model listing** — if the server has a richer native endpoint worth
+   preferring (like LM Studio's `/api/v0/models`), add a probe branch to
+   `listModelsRaw()` above the generic `/v1/models` fallback. Map the
+   response shape to `ModelInfo` inline.
+4. **`reasoning_effort` values** — if the backend accepts a different
+   set of values, update `getReasoningEffortValue()`. An unsupported value
+   is often a 400 error rather than a silent fallback, so prefer omitting
+   the field to sending a guess.
+5. **Capabilities metadata mapping** — if the native list format doesn't
    fit `ModelInfo`, map it in the probe function (see the Ollama
    `/api/tags` branch for an example).
+6. **Smoke-test** — run `test-mcp-e2e.mjs` against the new endpoint and
+   confirm the expected profile path fires by grepping the stderr log.
 
 ## Releasing
 
@@ -227,10 +279,14 @@ OpenAI-compatible server with no changes. What varies is:
    `new Server({name, version})` call in `src/index.ts`. Keep them in sync.
 2. Add a CHANGELOG entry under `## [X.Y.Z] - YYYY-MM-DD`.
 3. `npm run build` — must pass cleanly.
-4. `npm run shakedown` — smoke-test against a live endpoint.
-5. Commit `v{X.Y.Z}: short description` (version-prefixed for releases).
-6. Push and merge to `main`.
-7. `npm publish` (requires 2FA — run manually, not via automation).
+4. `npm run shakedown` — smoke-test against a live local endpoint.
+5. If the release touches provider-profile code, streaming, model routing,
+   or anything in the hot path, also run `test-mcp-e2e.mjs` against
+   **both** a local endpoint (LM Studio / Ollama) and OpenRouter — the
+   profile branches are gated separately. See the testing matrix above.
+6. Commit `v{X.Y.Z}: short description` (version-prefixed for releases).
+7. Push and merge to `main`.
+8. `npm publish` (requires 2FA — run manually, not via automation).
 
 The `prepublishOnly` hook runs the build automatically. Use
 `npm pack --dry-run` to preview the tarball contents before shipping.
@@ -256,18 +312,48 @@ The `prepublishOnly` hook runs the build automatically. Use
 
 ## Testing
 
-Three independent test harnesses:
+Four independent test harnesses, each with a different scope:
 
-- **`test.mjs`** — integration test. Hits the OpenAI-compatible API
-  directly. Good for regression-checking changes to streaming / parsing.
+- **`test.mjs`** — **direct-client** integration test. Hits the provider's
+  `/v1/*` endpoints without going through the MCP server. Good for
+  regression-checking changes to streaming / parsing and for confirming a
+  new provider speaks OpenAI protocol at all. Honours
+  `HOUTINI_LM_ENDPOINT_URL` / `HOUTINI_LM_API_KEY` (plus legacy
+  `LM_STUDIO_*` / `LM_PASSWORD` / `OPENROUTER_API_KEY`).
+- **`test-mcp-e2e.mjs`** — **end-to-end MCP** test. Spawns the built server
+  over stdio and drives real tool calls (`list_models`, `chat`, parallel
+  requests, optional `model` pin). This is the one that verifies
+  provider-profile paths fire correctly — grep the stderr log for
+  `OpenRouter model …: reasoning.exclude=true` to confirm the OpenRouter
+  branch took over. Set `PIN_MODEL=<id>` to also test the per-call model
+  override.
 - **`benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
 - **`shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
-  Runs all 7 tools end-to-end and prints a summary table. Use this to
-  verify an install or post-release.
+  Runs all 7 tools end-to-end and prints a summary table with TTFT, tok/s,
+  token counts, and reasoning-token split per call. Use this to verify an
+  install or post-release.
 
 The conversational equivalent lives in [SHAKEDOWN.md](./SHAKEDOWN.md) —
 paste it into a Claude session with houtini-lm attached and Claude drives
 the sequence, evaluating output quality along the way.
+
+### Testing matrix for provider changes
+
+When you touch provider-profile code, run the E2E harness against **both**
+a local and a remote endpoint before shipping. The two paths are gated by
+different profile flags and a local-only test won't catch regressions on
+the OpenRouter branch (and vice-versa):
+
+```bash
+# Local (LM Studio / Ollama / anything serialised)
+HOUTINI_LM_ENDPOINT_URL=http://localhost:1234 node test-mcp-e2e.mjs
+
+# Remote (OpenRouter — no semaphore, reasoning.exclude, retry policy)
+HOUTINI_LM_ENDPOINT_URL=https://openrouter.ai/api \
+  HOUTINI_LM_API_KEY=sk-or-v1-... \
+  PIN_MODEL=nvidia/nemotron-3-nano-30b-a3b:free \
+  node test-mcp-e2e.mjs
+```
 
 ## Quality-signal flags reference
 
