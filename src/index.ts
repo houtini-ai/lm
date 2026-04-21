@@ -34,7 +34,12 @@ import { isAbsolute, basename } from 'node:path';
 
 const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
-const LM_PASSWORD = process.env.LM_STUDIO_PASSWORD || '';
+const LM_PASSWORD =
+  process.env.LM_STUDIO_PASSWORD ||
+  process.env.LM_PASSWORD ||
+  process.env.OPENROUTER_API_KEY ||
+  '';
+const HOUTINI_LM_PROVIDER = (process.env.HOUTINI_LM_PROVIDER || '').toLowerCase();
 const DEFAULT_MAX_TOKENS = 16384;             // fallback when model context is unknown — overridden by dynamic calculation below
 const DEFAULT_TEMPERATURE = 0.3;
 const CONNECT_TIMEOUT_MS = 5000;
@@ -218,6 +223,8 @@ function isFirstBenchmarkedCall(modelId: string, tokPerSec: number): boolean {
 function apiHeaders(): Record<string, string> {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
   if (LM_PASSWORD) h['Authorization'] = `Bearer ${LM_PASSWORD}`;
+  const profile = getProviderProfile();
+  for (const [k, v] of Object.entries(profile.extraHeaders)) h[k] = v;
   return h;
 }
 
@@ -229,6 +236,9 @@ function apiHeaders(): Record<string, string> {
 let inferenceLock: Promise<void> = Promise.resolve();
 
 function withInferenceLock<T>(fn: () => Promise<T>): Promise<T> {
+  // Remote providers (OpenRouter etc.) benefit from parallelism and do
+  // their own rate-limit handling; serialising here just throttles us.
+  if (!getProviderProfile().serialiseInference) return fn();
   let release: () => void;
   const next = new Promise<void>((resolve) => { release = resolve; });
   const wait = inferenceLock;
@@ -547,6 +557,57 @@ async function fetchWithTimeout(
 }
 
 /**
+ * Parse Retry-After (seconds or HTTP-date) into ms. Null for unparseable.
+ */
+function parseRetryAfter(headerValue: string | null): number | null {
+  if (!headerValue) return null;
+  const asInt = parseInt(headerValue, 10);
+  if (Number.isFinite(asInt) && asInt >= 0) return asInt * 1000;
+  const asDate = Date.parse(headerValue);
+  if (Number.isFinite(asDate)) {
+    const delta = asDate - Date.now();
+    return delta > 0 ? delta : 0;
+  }
+  return null;
+}
+
+/**
+ * Retry a fetch on 429/5xx with jittered backoff. Only used when the
+ * current provider profile opts in (`retryOnRateLimit: true`). Each attempt
+ * gets its own fresh timeout so retries don't starve.
+ */
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number,
+  retries: number,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetchWithTimeout(url, options, timeoutMs);
+      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+        const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
+        try { await res.body?.cancel(); } catch { /* ignore */ }
+        const base = 400 * (attempt + 1);
+        const target = Math.min(Math.max(base, retryAfter ?? 0), 10_000);
+        const delay = Math.round(target * (0.5 + Math.random())); // 0.5×..1.5×
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) {
+        const delay = Math.round(400 * (attempt + 1) * (0.5 + Math.random()));
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+/**
  * Read from a stream with a per-chunk timeout.
  * Prevents hanging forever if the LLM stalls mid-generation.
  */
@@ -653,7 +714,23 @@ async function chatCompletionStreamingInner(
   // Hence the family-specific mapping below. When uncertain, we omit the
   // field entirely rather than risk a bad-value fallback.
   const modelId = (resolvedModel || '').toString();
-  if (modelId) {
+  const profile = getProviderProfile();
+
+  if (profile.reasoningStyle === 'openrouter-field') {
+    // OpenRouter exposes reasoning as a separate response field and takes a
+    // per-request `reasoning: { exclude: true }` param to suppress it at the
+    // source. We don't expose a thinking channel to MCP clients, so exclude
+    // is the cleanest option. We still inflate max_tokens because some
+    // providers bill/count reasoning tokens against the cap before exclude
+    // filtering — and because `exclude` only hides reasoning, it doesn't
+    // guarantee the model generates less of it.
+    body.reasoning = { exclude: true };
+    const beforeInflation = effectiveMaxTokens;
+    const inflated = Math.max(beforeInflation * 4, beforeInflation + 2000);
+    body.max_tokens = inflated;
+    body.max_completion_tokens = inflated;
+    process.stderr.write(`[houtini-lm] OpenRouter model ${modelId || '(unspecified)'}: reasoning.exclude=true, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
+  } else if (modelId) {
     const thinking = await getThinkingSupport(modelId);
     if (thinking?.supportsThinkingToggle) {
       body.enable_thinking = false;
@@ -673,11 +750,18 @@ async function chatCompletionStreamingInner(
 
   const startTime = Date.now();
 
-  const res = await fetchWithTimeout(
-    `${LM_BASE_URL}/v1/chat/completions`,
-    { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
-    INFERENCE_CONNECT_TIMEOUT_MS,
-  );
+  const res = profile.retryOnRateLimit
+    ? await fetchWithRetry(
+        `${LM_BASE_URL}/v1/chat/completions`,
+        { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
+        INFERENCE_CONNECT_TIMEOUT_MS,
+        2,
+      )
+    : await fetchWithTimeout(
+        `${LM_BASE_URL}/v1/chat/completions`,
+        { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
+        INFERENCE_CONNECT_TIMEOUT_MS,
+      );
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -909,11 +993,62 @@ async function chatCompletionStreamingInner(
 // regardless of backend — this flag is for enrichment (richer model metadata,
 // accurate "it's LM Studio, so the dev-toggle for reasoning_content matters"
 // hints in diagnostics, etc.).
-type Backend = 'lmstudio' | 'ollama' | 'openai-compat';
+type Backend = 'lmstudio' | 'ollama' | 'openai-compat' | 'openrouter';
 let detectedBackend: Backend | null = null;
 
 function getBackend(): Backend {
   return detectedBackend ?? 'openai-compat';
+}
+
+/**
+ * Provider profile — per-backend flags that gate behavioural differences
+ * (serialisation, retry, attribution headers, reasoning handling).
+ *
+ * Keep this minimal. Add flags only when a concrete divergence forces it,
+ * not speculatively — today's registry has 2 providers' worth of divergence.
+ */
+interface ProviderProfile {
+  /** Send OpenRouter-style attribution headers (HTTP-Referer, X-Title). */
+  extraHeaders: Record<string, string>;
+  /** True for local servers that run a single model and should not be
+   *  hammered with parallel requests. False for remote providers that
+   *  benefit from parallelism. */
+  serialiseInference: boolean;
+  /** Retry with backoff on 429/5xx for remote providers. */
+  retryOnRateLimit: boolean;
+  /** How reasoning-model output is returned.
+   *   - 'think-blocks': inline `<think>…</think>` in content (local models)
+   *   - 'openrouter-field': separate `message.reasoning` field
+   *   - 'none': no reasoning handling needed */
+  reasoningStyle: 'think-blocks' | 'openrouter-field' | 'none';
+}
+
+function getProviderProfile(): ProviderProfile {
+  const backend = getBackend();
+  const isOpenRouter =
+    backend === 'openrouter' ||
+    HOUTINI_LM_PROVIDER === 'openrouter' ||
+    /openrouter\.ai/i.test(LM_BASE_URL);
+
+  if (isOpenRouter) {
+    return {
+      extraHeaders: {
+        'HTTP-Referer': 'https://github.com/houtini-ai/lm',
+        'X-Title': 'houtini-lm',
+      },
+      serialiseInference: false,
+      retryOnRateLimit: true,
+      reasoningStyle: 'openrouter-field',
+    };
+  }
+
+  // Local / OpenAI-compatible defaults.
+  return {
+    extraHeaders: {},
+    serialiseInference: true,
+    retryOnRateLimit: false,
+    reasoningStyle: 'think-blocks',
+  };
 }
 
 /**
@@ -923,6 +1058,37 @@ function getBackend(): Backend {
  *   3. OpenAI-compatible /v1/models — generic fallback (DeepSeek, vLLM, llama.cpp, OpenRouter)
  */
 async function listModelsRaw(): Promise<ModelInfo[]> {
+  // OpenRouter short-circuit — no point probing LM Studio/Ollama-specific
+  // endpoints. /v1/models returns richer metadata than our fallback path
+  // normally exposes: context_length, architecture.input_modalities, pricing.
+  const isOpenRouter =
+    HOUTINI_LM_PROVIDER === 'openrouter' || /openrouter\.ai/i.test(LM_BASE_URL);
+  if (isOpenRouter) {
+    const res = await fetchWithTimeout(
+      `${LM_BASE_URL}/v1/models`,
+      { headers: apiHeaders() },
+    );
+    if (!res.ok) throw new Error(`Failed to list OpenRouter models: ${res.status}`);
+    const data = (await res.json()) as {
+      data: Array<{
+        id: string;
+        name?: string;
+        context_length?: number;
+        architecture?: { input_modalities?: string[]; output_modalities?: string[] };
+      }>;
+    };
+    detectedBackend = 'openrouter';
+    return data.data.map((m) => ({
+      id: m.id,
+      object: 'model',
+      type: 'llm',
+      state: 'loaded', // OpenRouter models are always routable
+      context_length: m.context_length,
+      max_context_length: m.context_length,
+      publisher: m.id.includes('/') ? m.id.split('/')[0] : undefined,
+    }));
+  }
+
   // Try LM Studio's v0 API first — returns type, arch, publisher, quantization, state
   try {
     const v0 = await fetchWithTimeout(
@@ -1551,7 +1717,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.12.0' },
+  { name: 'houtini-lm', version: '2.13.0' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 

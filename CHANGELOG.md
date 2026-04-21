@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.13.0] - 2026-04-21
+
+### Added
+- **OpenRouter support** — detected automatically when `LM_STUDIO_URL` contains `openrouter.ai`, or forced via `HOUTINI_LM_PROVIDER=openrouter`. Attribution headers (`HTTP-Referer`, `X-Title`) are sent per request. Auth via `LM_STUDIO_PASSWORD` / `LM_PASSWORD` / `OPENROUTER_API_KEY` (all three names accepted).
+- **Provider-profile layer** — small central registry (`getProviderProfile()`) gates per-backend behaviour: extra request headers, inference serialisation, 429/5xx retry policy, and reasoning-model output handling. Keeps per-provider divergence in one place so adding Groq/Together/Fireworks later is a config change, not a scavenger hunt across the file.
+- **Jittered retry-with-backoff on 429/5xx** for remote providers (`fetchWithRetry`). Honours `Retry-After` header (seconds or HTTP-date) with a 10s ceiling. Local providers are unchanged — still a single-shot fetch.
+- **End-to-end MCP smoke test** (`test-mcp-e2e.mjs`) — spawns the built server over stdio and drives real tool calls. Used to validate provider paths against both LM Studio and OpenRouter without mocking.
+
+### Changed
+- **Inference semaphore is now provider-gated** — only serialises requests for local/LM-Studio/Ollama backends (where a single GPU is being contended for). Remote providers bypass the lock and can serve parallel calls, which OpenRouter and similar multi-host backends handle natively.
+- **Reasoning-model handling branches on provider**. Local thinking models still get `enable_thinking:false` + `reasoning_effort` + max_tokens inflation. OpenRouter gets `reasoning: { exclude: true }` (which the provider normalises across Nemotron, DeepSeek R1, Qwen3, Claude thinking etc.) plus the same max_tokens inflation to defend against providers that bill reasoning tokens against the cap before exclude filtering.
+- **Model listing short-circuits for OpenRouter** — skips LM Studio `/api/v0/models` and Ollama `/api/tags` probes and goes straight to `/v1/models`, which on OpenRouter already returns `context_length` and `architecture.input_modalities` at the richness our routing needs.
+- **`test.mjs` honours `LM_PASSWORD` / `OPENROUTER_API_KEY`** for bearer auth, so the same suite can run against remote providers for smoke testing.
+
 ## [2.12.0] - 2026-04-21
 
 ### Fixed

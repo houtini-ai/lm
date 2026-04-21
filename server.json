@@ -7,12 +7,12 @@
     "url": "https://github.com/houtini-ai/lm",
     "source": "github"
   },
-  "version": "2.12.0",
+  "version": "2.13.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@houtini/lm",
-      "version": "2.12.0",
+      "version": "2.13.0",
       "transport": [
         {
           "type": "stdio"
@@ -33,9 +33,15 @@
         },
         {
           "name": "LM_STUDIO_PASSWORD",
-          "description": "Bearer token for API authentication (no auth if blank)",
+          "description": "Bearer token for API authentication. Aliases: LM_PASSWORD, OPENROUTER_API_KEY.",
           "isRequired": false,
           "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "HOUTINI_LM_PROVIDER",
+          "description": "Optional provider override: 'openrouter' forces OpenRouter-specific handling (attribution headers, reasoning.exclude, no inference serialisation). Auto-detected from LM_STUDIO_URL when possible.",
+          "isRequired": false,
           "format": "string"
         }
       ]
