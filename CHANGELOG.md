@@ -3,6 +3,7 @@
 ## [2.13.0] - 2026-04-21
 
 ### Added
+- **`HOUTINI_LM_*` env var namespace** — now that multiple providers are supported the `LM_STUDIO_*` prefix is misleading. New preferred names: `HOUTINI_LM_ENDPOINT_URL`, `HOUTINI_LM_API_KEY`, `HOUTINI_LM_MODEL`, `HOUTINI_LM_PROVIDER`, `HOUTINI_LM_CONTEXT_WINDOW`. Legacy `LM_STUDIO_URL` / `LM_STUDIO_MODEL` / `LM_STUDIO_PASSWORD` / `LM_PASSWORD` / `OPENROUTER_API_KEY` / `LM_CONTEXT_WINDOW` remain accepted indefinitely — existing configs keep working untouched.
 - **OpenRouter support** — detected automatically when `LM_STUDIO_URL` contains `openrouter.ai`, or forced via `HOUTINI_LM_PROVIDER=openrouter`. Attribution headers (`HTTP-Referer`, `X-Title`) are sent per request. Auth via `LM_STUDIO_PASSWORD` / `LM_PASSWORD` / `OPENROUTER_API_KEY` (all three names accepted).
 - **Provider-profile layer** — small central registry (`getProviderProfile()`) gates per-backend behaviour: extra request headers, inference serialisation, 429/5xx retry policy, and reasoning-model output handling. Keeps per-provider divergence in one place so adding Groq/Together/Fireworks later is a config change, not a scavenger hunt across the file.
 - **Jittered retry-with-backoff on 429/5xx** for remote providers (`fetchWithRetry`). Honours `Retry-After` header (seconds or HTTP-date) with a 10s ceiling. Local providers are unchanged — still a single-shot fetch.

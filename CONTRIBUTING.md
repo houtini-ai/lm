@@ -25,7 +25,7 @@ All TypeScript is strict mode. Build must pass with zero errors before you open 
 ## Testing
 
 ```bash
-LM_STUDIO_URL=http://localhost:1234 node test.mjs
+HOUTINI_LM_ENDPOINT_URL=http://localhost:1234 node test.mjs
 ```
 
 `test.mjs` is an integration test — it hits a live LLM server and runs sequential assertions. There is no mocking layer and no unit-test framework; this is deliberate (see [CLAUDE.md](./CLAUDE.md) → *Coding Conventions*).

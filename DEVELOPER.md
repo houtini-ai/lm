@@ -32,7 +32,7 @@ npm run shakedown    # end-to-end self-test — sanity-check install + benchmark
 Integration test:
 
 ```bash
-LM_STUDIO_URL=http://host:1234 node test.mjs
+HOUTINI_LM_ENDPOINT_URL=http://host:1234 node test.mjs
 ```
 
 Strict-mode TypeScript is enabled — the build must pass with zero errors.

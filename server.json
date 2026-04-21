@@ -20,27 +20,27 @@
       ],
       "environmentVariables": [
         {
-          "name": "LM_STUDIO_URL",
-          "description": "Base URL of the OpenAI-compatible API endpoint",
+          "name": "HOUTINI_LM_ENDPOINT_URL",
+          "description": "Base URL of the OpenAI-compatible API endpoint (e.g. http://localhost:1234, https://openrouter.ai/api). Legacy alias: LM_STUDIO_URL.",
           "isRequired": false,
           "format": "url"
         },
         {
-          "name": "LM_STUDIO_MODEL",
-          "description": "Model identifier to use for requests (auto-detected if not set)",
-          "isRequired": false,
-          "format": "string"
-        },
-        {
-          "name": "LM_STUDIO_PASSWORD",
-          "description": "Bearer token for API authentication. Aliases: LM_PASSWORD, OPENROUTER_API_KEY.",
+          "name": "HOUTINI_LM_API_KEY",
+          "description": "Bearer token for API authentication (no auth if blank). Legacy aliases: LM_STUDIO_PASSWORD, LM_PASSWORD, OPENROUTER_API_KEY.",
           "isRequired": false,
           "isSecret": true,
           "format": "string"
         },
         {
+          "name": "HOUTINI_LM_MODEL",
+          "description": "Model identifier to use for requests (auto-detected if not set). Legacy alias: LM_STUDIO_MODEL.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
           "name": "HOUTINI_LM_PROVIDER",
-          "description": "Optional provider override: 'openrouter' forces OpenRouter-specific handling (attribution headers, reasoning.exclude, no inference serialisation). Auto-detected from LM_STUDIO_URL when possible.",
+          "description": "Optional provider override: 'openrouter' forces OpenRouter-specific handling (attribution headers, reasoning.exclude, no inference serialisation). Auto-detected from the endpoint URL when possible.",
           "isRequired": false,
           "format": "string"
         }

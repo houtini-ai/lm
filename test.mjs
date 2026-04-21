@@ -8,9 +8,14 @@
  * LM_STUDIO_MODEL is not set.
  */
 
-const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';
-let MODEL = process.env.LM_STUDIO_MODEL || '';
-const API_KEY = process.env.LM_PASSWORD || process.env.OPENROUTER_API_KEY || '';
+const BASE = process.env.HOUTINI_LM_ENDPOINT_URL || process.env.LM_STUDIO_URL || 'http://localhost:1234';
+let MODEL = process.env.HOUTINI_LM_MODEL || process.env.LM_STUDIO_MODEL || '';
+const API_KEY =
+  process.env.HOUTINI_LM_API_KEY ||
+  process.env.LM_STUDIO_PASSWORD ||
+  process.env.LM_PASSWORD ||
+  process.env.OPENROUTER_API_KEY ||
+  '';
 
 function authHeaders(extra = {}) {
   const h = { ...extra };

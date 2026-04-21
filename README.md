@@ -53,7 +53,7 @@ That's it. If LM Studio's running on `localhost:1234` (the default), Claude can 
 I've got a GPU box on my local network running Qwen 3 Coder Next in LM Studio. If you've got a similar setup, point the URL at it:
 
 ```bash
-claude mcp add houtini-lm -e LM_STUDIO_URL=http://192.168.1.50:1234 -- npx -y @houtini/lm
+claude mcp add houtini-lm -e HOUTINI_LM_ENDPOINT_URL=http://192.168.1.50:1234 -- npx -y @houtini/lm
 ```
 
 ### Cloud APIs
@@ -62,8 +62,20 @@ Works with anything speaking the OpenAI format. DeepSeek at twenty-eight cents p
 
 ```bash
 claude mcp add houtini-lm \
-  -e LM_STUDIO_URL=https://api.deepseek.com \
-  -e LM_STUDIO_PASSWORD=your-key-here \
+  -e HOUTINI_LM_ENDPOINT_URL=https://api.deepseek.com \
+  -e HOUTINI_LM_API_KEY=your-key-here \
+  -- npx -y @houtini/lm
+```
+
+### OpenRouter
+
+OpenRouter gives you 300+ models through one endpoint. Auto-detected from the URL — attribution headers, `reasoning.exclude`, and retry-with-backoff all kick in automatically:
+
+```bash
+claude mcp add houtini-lm \
+  -e HOUTINI_LM_ENDPOINT_URL=https://openrouter.ai/api \
+  -e HOUTINI_LM_API_KEY=sk-or-v1-... \
+  -e HOUTINI_LM_MODEL=nvidia/nemotron-3-nano-30b-a3b:free \
   -- npx -y @houtini/lm
 ```
 
@@ -78,7 +90,7 @@ Drop this into your `claude_desktop_config.json`:
       "command": "npx",
       "args": ["-y", "@houtini/lm"],
       "env": {
-        "LM_STUDIO_URL": "http://localhost:1234"
+        "HOUTINI_LM_ENDPOINT_URL": "http://localhost:1234"
       }
     }
   }
@@ -412,10 +424,11 @@ Parallel MCP tool calls are automatically queued and run one at a time. Most loc
 
 | Variable | Default | What it does |
 |----------|---------|-------------|
-| `LM_STUDIO_URL` | `http://localhost:1234` | Base URL of the OpenAI-compatible API |
-| `LM_STUDIO_MODEL` | *(auto-detect)* | Model identifier - leave blank to use whatever's loaded |
-| `LM_STUDIO_PASSWORD` | *(none)* | Bearer token for authenticated endpoints |
-| `LM_CONTEXT_WINDOW` | `100000` | Fallback context window if the API doesn't report it |
+| `HOUTINI_LM_ENDPOINT_URL` | `http://localhost:1234` | Base URL of the OpenAI-compatible API. Legacy alias: `LM_STUDIO_URL`. |
+| `HOUTINI_LM_API_KEY` | *(none)* | Bearer token for authenticated endpoints. Legacy aliases: `LM_STUDIO_PASSWORD`, `LM_PASSWORD`, `OPENROUTER_API_KEY`. |
+| `HOUTINI_LM_MODEL` | *(auto-detect)* | Model identifier — leave blank to use whatever's loaded. Legacy alias: `LM_STUDIO_MODEL`. |
+| `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider-specific handling. Set to `openrouter` for OpenRouter attribution headers, `reasoning.exclude`, and no inference serialisation. Otherwise auto-detected from the endpoint URL. |
+| `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window if the API doesn't report it. Legacy alias: `LM_CONTEXT_WINDOW`. |
 
 ## Compatible endpoints
 
@@ -424,7 +437,8 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 | What | URL | Notes |
 |------|-----|-------|
 | [LM Studio](https://lmstudio.ai) | `http://localhost:1234` | Default, zero config. Rich metadata via v0 API. |
-| [Ollama](https://ollama.com) | `http://localhost:11434` | Set `LM_STUDIO_URL`. Thinking models (qwen3, deepseek-r1) handled transparently — reasoning is captured from Ollama's `delta.reasoning` channel and the output budget is inflated automatically so small thinking models don't return empty bodies. |
+| [Ollama](https://ollama.com) | `http://localhost:11434` | Set `HOUTINI_LM_ENDPOINT_URL`. Thinking models (qwen3, deepseek-r1) handled transparently — reasoning is captured from Ollama's `delta.reasoning` channel and the output budget is inflated automatically so small thinking models don't return empty bodies. |
+| [OpenRouter](https://openrouter.ai) | `https://openrouter.ai/api` | 300+ models from one endpoint. Auto-detected — sends attribution headers, uses `reasoning.exclude` for thinking models, retries 429/5xx with jittered backoff, parallel requests allowed. |
 | [vLLM](https://docs.vllm.ai) | `http://localhost:8000` | Native OpenAI API |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `http://localhost:8080` | Server mode |
 | [DeepSeek](https://platform.deepseek.com) | `https://api.deepseek.com` | 28c/M input tokens |

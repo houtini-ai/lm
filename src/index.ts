@@ -32,9 +32,19 @@ import {
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, basename } from 'node:path';
 
-const LM_BASE_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234';
-const LM_MODEL = process.env.LM_STUDIO_MODEL || '';
+// Env var naming: HOUTINI_LM_* is the preferred namespace now that we
+// support more than just LM Studio. The legacy LM_STUDIO_* names remain
+// accepted indefinitely so existing users don't need to change anything.
+const LM_BASE_URL =
+  process.env.HOUTINI_LM_ENDPOINT_URL ||
+  process.env.LM_STUDIO_URL ||
+  'http://localhost:1234';
+const LM_MODEL =
+  process.env.HOUTINI_LM_MODEL ||
+  process.env.LM_STUDIO_MODEL ||
+  '';
 const LM_PASSWORD =
+  process.env.HOUTINI_LM_API_KEY ||
   process.env.LM_STUDIO_PASSWORD ||
   process.env.LM_PASSWORD ||
   process.env.OPENROUTER_API_KEY ||
@@ -48,7 +58,10 @@ const SOFT_TIMEOUT_MS = 300_000;             // 5 min — progress notifications
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk mid-stream
 const PREFILL_TIMEOUT_MS = 180_000;          // max wait for the FIRST chunk — prompt prefill on slow hardware with big inputs can legitimately take 1-2 min
 const PREFILL_KEEPALIVE_MS = 10_000;         // fire a progress notification every N ms while waiting for prefill to finish
-const FALLBACK_CONTEXT_LENGTH = parseInt(process.env.LM_CONTEXT_WINDOW || '100000', 10);
+const FALLBACK_CONTEXT_LENGTH = parseInt(
+  process.env.HOUTINI_LM_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || '100000',
+  10,
+);
 
 // ── Session-level token accounting ───────────────────────────────────
 // Tracks cumulative tokens offloaded to the local LLM across all calls
