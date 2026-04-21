@@ -1299,12 +1299,21 @@ interface RoutingDecision {
   suggestion?: string;  // info about routing decision
 }
 
-async function routeToModel(taskType: TaskType): Promise<RoutingDecision> {
+async function routeToModel(taskType: TaskType, override?: string): Promise<RoutingDecision> {
+  // Explicit override wins over routing. Honoured regardless of whether we
+  // can even list models — useful for remote providers (OpenRouter) where
+  // the user knows the model id and doesn't want routing to second-guess.
+  const pinned = override || LM_MODEL;
+  if (pinned) {
+    const hints = getPromptHints(pinned);
+    return { modelId: pinned, hints };
+  }
+
   let models: ModelInfo[];
   try {
     models = await listModelsRaw();
   } catch {
-    // Can't reach server — fall back to default
+    // Can't reach server — fall back to default (empty string; caller handles)
     const hints = getPromptHints(LM_MODEL);
     return { modelId: LM_MODEL || '', hints };
   }
@@ -1529,6 +1538,10 @@ const TOOLS = [
           type: 'object',
           description: 'Force structured JSON output. Provide a JSON Schema object and the response will be guaranteed valid JSON conforming to it. Example: {"name":"result","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}}',
         },
+        model: {
+          type: 'string',
+          description: 'Optional: pin to a specific model id (e.g. "nvidia/nemotron-3-nano-30b-a3b:free" on OpenRouter, "qwen.qwen3-coder-30b-a3b-instruct" on LM Studio). When set, overrides automatic routing. Useful on providers with many models where auto-routing picks poorly.',
+        },
       },
       required: ['message'],
     },
@@ -1576,6 +1589,10 @@ const TOOLS = [
           type: 'object',
           description: 'Force structured JSON output. Provide a JSON Schema object and the response will be guaranteed valid JSON conforming to it.',
         },
+        model: {
+          type: 'string',
+          description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
+        },
       },
       required: ['instruction'],
     },
@@ -1614,6 +1631,10 @@ const TOOLS = [
         max_tokens: {
           type: 'number',
           description: 'Max response tokens. Defaults to 25% of the loaded model\'s context window (fallback 16,384).',
+        },
+        model: {
+          type: 'string',
+          description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
       },
       required: ['code', 'task'],
@@ -1654,6 +1675,10 @@ const TOOLS = [
         max_tokens: {
           type: 'number',
           description: 'Optional output budget override. Defaults to 25% of the loaded model\'s context window.',
+        },
+        model: {
+          type: 'string',
+          description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
       },
       required: ['paths', 'task'],
@@ -1730,7 +1755,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.13.0' },
+  { name: 'houtini-lm', version: '2.13.1' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 
@@ -1794,15 +1819,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'chat': {
-        const { message, system, temperature, max_tokens, json_schema } = args as {
+        const { message, system, temperature, max_tokens, json_schema, model } = args as {
           message: string;
           system?: string;
           temperature?: number;
           max_tokens?: number;
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
+          model?: string;
         };
 
-        const route = await routeToModel('chat');
+        const route = await routeToModel('chat', model);
         const messages: ChatMessage[] = [];
         // Inject output constraint into system prompt if the model needs it
         const systemContent = system
@@ -1828,16 +1854,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'custom_prompt': {
-        const { system, context, instruction, temperature, max_tokens, json_schema } = args as {
+        const { system, context, instruction, temperature, max_tokens, json_schema, model } = args as {
           system?: string;
           context?: string;
           instruction: string;
           temperature?: number;
           max_tokens?: number;
           json_schema?: { name: string; schema: Record<string, unknown>; strict?: boolean };
+          model?: string;
         };
 
-        const route = await routeToModel('analysis');
+        const route = await routeToModel('analysis', model);
         const messages: ChatMessage[] = [];
         const systemContent = system
           ? (route.hints.outputConstraint ? `${system}\n\n${route.hints.outputConstraint}` : system)
@@ -1872,15 +1899,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'code_task': {
-        const { code, task, language, max_tokens: codeMaxTokens } = args as {
+        const { code, task, language, max_tokens: codeMaxTokens, model } = args as {
           code: string;
           task: string;
           language?: string;
           max_tokens?: number;
+          model?: string;
         };
 
         const lang = language || 'unknown';
-        const route = await routeToModel('code');
+        const route = await routeToModel('code', model);
         const outputConstraint = route.hints.outputConstraint
           ? ` ${route.hints.outputConstraint}`
           : '';
@@ -1911,11 +1939,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'code_task_files': {
-        const { paths, task, language, max_tokens: codeMaxTokens } = args as {
+        const { paths, task, language, max_tokens: codeMaxTokens, model } = args as {
           paths: string[];
           task: string;
           language?: string;
           max_tokens?: number;
+          model?: string;
         };
 
         if (!Array.isArray(paths) || paths.length === 0) {
@@ -1962,7 +1991,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const lang = language || 'unknown';
-        const route = await routeToModel('code');
+        const route = await routeToModel('code', model);
         const outputConstraint = route.hints.outputConstraint
           ? ` ${route.hints.outputConstraint}`
           : '';

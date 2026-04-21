@@ -1,6 +1,6 @@
 {
   "name": "@houtini/lm",
-  "version": "2.13.0",
+  "version": "2.13.1",
   "type": "module",
   "description": "MCP server for local LLMs — connects to LM Studio or any OpenAI-compatible endpoint",
   "mcpName": "io.github.houtini-ai/lm",

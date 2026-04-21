@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.13.1] - 2026-04-21
+
+### Changed
+- **`HOUTINI_LM_MODEL` is now a genuine override**, not just a routing fallback. When set, every tool call uses that model id without running through the scoring path. Previously the env var was only consulted when routing failed entirely, which meant that on OpenRouter (where all 343 models report as "loaded") the router would pick essentially at random regardless of the user's configured preference. Backwards-compatible: if the env var is unset, routing behaves exactly as before.
+
+### Added
+- **Optional `model` parameter on `chat`, `custom_prompt`, `code_task`, `code_task_files`** — lets the caller pin a specific model id per-tool-call, overriding both routing and `HOUTINI_LM_MODEL`. Especially useful on OpenRouter: pass `model: "nvidia/nemotron-3-nano-30b-a3b:free"` or `model: "moonshotai/kimi-k2.6"` directly from the MCP client. `embed` already had a `model` parameter.
+
 ## [2.13.0] - 2026-04-21
 
 ### Added

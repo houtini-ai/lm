@@ -114,6 +114,23 @@ try {
     if (!/arr+!?/i.test(text)) throw new Error(`Not piratey: ${text.slice(0, 200)}`);
   });
 
+  // Only run the model-pin test when an explicit override model is given.
+  // We check both that the call succeeds AND that the returned footer
+  // reports the pinned model id, which is how we know routing respected it.
+  if (process.env.PIN_MODEL) {
+    await test(`chat: per-call model override (${process.env.PIN_MODEL})`, async () => {
+      const res = await callTool('chat', {
+        message: 'Reply with just the word OK.',
+        model: process.env.PIN_MODEL,
+        max_tokens: 256,
+      });
+      const text = res.content?.[0]?.text || '';
+      if (!text.includes(process.env.PIN_MODEL)) {
+        throw new Error(`Footer does not reference pinned model. Got: ${text.slice(-400)}`);
+      }
+    });
+  }
+
   await test('chat: parallel requests (3)', async () => {
     const mkCall = (a, b) => callTool('chat', {
       message: `What is ${a}+${b}? Reply with just the number.`,
