@@ -6,6 +6,7 @@ memory/
 MEMORY.md
 .env
 .env.*
+.secrets
 *.log
 *.tgz
 *.tsbuildinfo

@@ -763,18 +763,55 @@ async function chatCompletionStreamingInner(
 
   const startTime = Date.now();
 
-  const res = profile.retryOnRateLimit
-    ? await fetchWithRetry(
-        `${LM_BASE_URL}/v1/chat/completions`,
-        { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
-        INFERENCE_CONNECT_TIMEOUT_MS,
-        2,
-      )
-    : await fetchWithTimeout(
-        `${LM_BASE_URL}/v1/chat/completions`,
-        { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
-        INFERENCE_CONNECT_TIMEOUT_MS,
-      );
+  // Progress-notification plumbing lifted ABOVE the fetch so we can keep the
+  // MCP client's request timeout alive during the HTTP handshake with the
+  // upstream LLM. On slow backends (big prompt, heavy prefill, cold model)
+  // the POST to /v1/chat/completions can sit for 30-60+ seconds before the
+  // response headers flush — that window used to be silent and would trip
+  // the client's 60s default timeout before any SSE chunk reached us.
+  let progressSeq = 0;
+  const sendProgress = (message: string) => {
+    if (options.progressToken === undefined) return;
+    progressSeq++;
+    server.notification({
+      method: 'notifications/progress',
+      params: {
+        progressToken: options.progressToken,
+        progress: progressSeq,
+        message,
+      },
+    }).catch(() => { /* best-effort — don't break streaming */ });
+  };
+
+  // Ping once immediately — resets the client's timeout clock as soon as the
+  // tool call is acknowledged server-side, regardless of how long prefill or
+  // the upstream handshake takes.
+  sendProgress('Connecting to model...');
+
+  // Pre-fetch heartbeat — keep the client alive while we wait for the
+  // upstream LLM to return response headers. Cleared once fetch resolves.
+  const preFetchTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    const waitedMs = Date.now() - startTime;
+    sendProgress(`Connecting to model... (${(waitedMs / 1000).toFixed(0)}s)`);
+  }, PREFILL_KEEPALIVE_MS);
+
+  let res: Response;
+  try {
+    res = profile.retryOnRateLimit
+      ? await fetchWithRetry(
+          `${LM_BASE_URL}/v1/chat/completions`,
+          { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
+          INFERENCE_CONNECT_TIMEOUT_MS,
+          2,
+        )
+      : await fetchWithTimeout(
+          `${LM_BASE_URL}/v1/chat/completions`,
+          { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
+          INFERENCE_CONNECT_TIMEOUT_MS,
+        );
+  } finally {
+    clearInterval(preFetchTimer);
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -789,7 +826,6 @@ async function chatCompletionStreamingInner(
   const decoder = new TextDecoder();
   let content = '';
   let reasoning = '';
-  let progressSeq = 0;
   let model = '';
   let usage: StreamingResult['usage'];
   let finishReason = '';
@@ -799,23 +835,9 @@ async function chatCompletionStreamingInner(
   let ttftMs: number | undefined;
   let firstChunkReceived = false;
 
-  // Prefill keep-alive — /v1/chat/completions gives no SSE events during
-  // prompt processing, so the MCP client clock ticks uninterrupted on a slow
-  // backend with a big input. Fire a progress notification every 10s until
-  // the first chunk arrives to keep the client from timing out at 60s.
-  const sendProgress = (message: string) => {
-    if (options.progressToken === undefined) return;
-    progressSeq++;
-    server.notification({
-      method: 'notifications/progress',
-      params: {
-        progressToken: options.progressToken,
-        progress: progressSeq,
-        message,
-      },
-    }).catch(() => { /* best-effort — don't break streaming */ });
-  };
-
+  // Prefill keep-alive — even after HTTP headers flush, the first SSE chunk
+  // can still lag while the model finishes prompt processing. Fire a progress
+  // notification every 10s until the first chunk arrives.
   const keepAliveTimer: ReturnType<typeof setInterval> = setInterval(() => {
     if (firstChunkReceived) return;
     const waitedMs = Date.now() - startTime;
@@ -1755,7 +1777,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.13.1' },
+  { name: 'houtini-lm', version: '2.13.2' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 

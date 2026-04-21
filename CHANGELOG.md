@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.13.2] - 2026-04-21
+
+### Fixed
+- **Pre-fetch progress heartbeat** — streaming keepalive used to start only after the upstream LLM returned HTTP response headers. On slow backends (big prompt, heavy prefill, cold model) the POST to `/v1/chat/completions` can sit open for 30–60+ seconds before headers flush, and that window was silent — tripping MCP clients with the default 60s request timeout before any progress notification could fire. `chatCompletionStreamingInner` now sends a progress notification immediately on tool-call receipt (resetting the client clock as soon as the call is acknowledged) plus a 10s heartbeat while awaiting upstream response headers. The existing post-fetch prefill keepalive is preserved. Clients that honour `resetTimeoutOnProgress` (Claude Desktop and similar) will now survive multi-minute prefills cleanly.
+
 ## [2.13.1] - 2026-04-21
 
 ### Changed
