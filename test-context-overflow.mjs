@@ -23,6 +23,9 @@ eq('llama.cpp n_ctx',
 eq('generic context window',
   parseContextOverflow('context window of 32768 tokens exceeded'),
   32768);
+eq('thousands separator (comma)',
+  parseContextOverflow('max_completion_tokens=99002 cannot be greater than max_model_len=65,536'),
+  65536);
 
 // --- non-overflow errors must NOT match (so we surface the real error, not retry) ---
 eq('unrelated 400 → null', parseContextOverflow('The model `coder-next` does not exist.'), null);

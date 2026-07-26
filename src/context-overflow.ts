@@ -28,16 +28,20 @@
 export function parseContextOverflow(text: string): number | null {
   if (!text) return null;
   const patterns: RegExp[] = [
-    /max_model_len\D*(\d{2,})/i,               // vLLM — grabs the final number after max_model_len
-    /maximum context length is\s*(\d{2,})/i,   // OpenAI
-    /context (?:length|size|window)\D*(\d{2,})/i,
-    /n_ctx\s*=\s*(\d{2,})/i,                    // llama.cpp
+    /max_model_len\D*([\d,]{2,})/i,               // vLLM — grabs the final number after max_model_len
+    /maximum context length is\s*([\d,]{2,})/i,   // OpenAI
+    /context (?:length|size|window)\D*([\d,]{2,})/i,
+    /n_ctx\s*=\s*([\d,]{2,})/i,                    // llama.cpp
   ];
   for (const p of patterns) {
     const m = text.match(p);
     if (m) {
-      const n = Number(m[1]);
-      if (Number.isFinite(n) && n > 0) return n;
+      // Numbers may carry thousands separators ("65,536"); strip before parsing.
+      const cleaned = m[1].replace(/,/g, '');
+      if (/^\d{2,}$/.test(cleaned)) {
+        const n = Number(cleaned);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
     }
   }
   return null;
