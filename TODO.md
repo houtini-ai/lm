@@ -15,6 +15,15 @@ plus anything too small to warrant an issue.
 | #20 | Security tail | Forgeable-footer trust boundary (wants MCP `structuredContent`); TOCTOU note |
 | #22 | Correctness tail | `getReasoningEffortValue` tradeoff; unbounded body-read deadline |
 
+## Scoped, ready to promote to an issue
+
+- **CLI mode** — run houtini-lm as a plain command, not just an MCP server, so an
+  orchestrator can drive the fleet from a terminal with no ~60s MCP tool-call ceiling
+  (reasoning-model calls exceed it) and no duplicated logic. Design in
+  [`docs/CLI-MODE.md`](docs/CLI-MODE.md): extract the CallTool switch into a shared
+  `handleToolCall()`, branch the entry on a recognised subcommand, keep the no-args
+  MCP launch. Obsoletes the `fleet.mjs` stopgap in `local-llm`.
+
 ## Done
 
 - **Savings telemetry** — the response footer now shows cumulative Claude-quota
