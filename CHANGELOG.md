@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Context-overflow self-heal.** Strict backends (vLLM) reject `prompt + max_tokens > context` with a 400 instead of clamping. houtini-lm sizes its output budget from the context reported by `/v1/models` — but that number is wrong when a proxy sits in front (e.g. a LiteLLM router advertising a generic 100k window over a model actually loaded at 64k), producing a spurious 400 (`max_completion_tokens=99002 … max_model_len=65536`). houtini-lm now parses the real limit from the backend's own error and **retries once** with a corrected budget — robust even when the advertised context is wrong, and self-correcting across vLLM / OpenAI / llama.cpp error shapes. New `src/context-overflow.ts` (unit-tested via `npm run test:overflow`).
+
 ## [3.2.2] - 2026-07-24
 
 Docs-only release (no code change). Ships the README addition documenting

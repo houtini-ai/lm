@@ -10,6 +10,7 @@
   },
   "scripts": {
     "test:vllm": "node test-vllm-thinking.mjs",
+    "test:overflow": "node test-context-overflow.mjs",
     "build": "tsc && node add-shebang.mjs",
     "dev": "tsc --watch",
     "shakedown": "node shakedown.mjs",

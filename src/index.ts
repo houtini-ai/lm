@@ -35,6 +35,7 @@ import {
   type PromptHints,
 } from './model-cache.js';
 import { acquireInferenceLock } from './inference-lock.js';
+import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -1140,20 +1141,49 @@ async function chatCompletionStreamingInner(
     sendProgress(`Connecting to model... (${(waitedMs / 1000).toFixed(0)}s)`);
   }, PREFILL_KEEPALIVE_MS);
 
-  let res: Response;
-  try {
-    res = profile.retryOnRateLimit
-      ? await fetchWithRetry(
+  const issueRequest = (): Promise<Response> =>
+    profile.retryOnRateLimit
+      ? fetchWithRetry(
           `${LM_BASE_URL}/v1/chat/completions`,
           { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
           INFERENCE_CONNECT_TIMEOUT_MS,
           2,
         )
-      : await fetchWithTimeout(
+      : fetchWithTimeout(
           `${LM_BASE_URL}/v1/chat/completions`,
           { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body) },
           INFERENCE_CONNECT_TIMEOUT_MS,
         );
+
+  let res: Response;
+  try {
+    res = await issueRequest();
+
+    // Context-overflow self-heal. A strict backend (vLLM) rejects
+    // prompt+max_tokens > context with a 400 instead of clamping. This fires
+    // when the context we detected via /v1/models is larger than the model
+    // actually loaded — classically a proxy (LiteLLM router) advertising a
+    // generic window (e.g. 100k) in front of a 64k model. The server states
+    // its real limit in the error; parse it, resize the budget, and retry ONCE.
+    if (!res.ok && res.status === 400) {
+      const errText = await res.text().catch(() => '');
+      const realLimit = parseContextOverflow(errText);
+      const currentMax = Number(body.max_tokens) || 0;
+      const corrected = realLimit
+        ? correctedMaxTokens(realLimit, promptChars, messages.length)
+        : 0;
+      if (realLimit && corrected > 0 && corrected < currentMax) {
+        process.stderr.write(
+          `[houtini-lm] Backend context is ${realLimit} tokens (smaller than the ${contextLen ?? 'unknown'} we detected — likely a proxy advertising a generic window). max_tokens ${currentMax} → ${corrected}; retrying once.\n`,
+        );
+        body.max_tokens = corrected;
+        body.max_completion_tokens = corrected;
+        res = await issueRequest();
+      } else {
+        // Not a recoverable context overflow — surface the original error.
+        throw new Error(`LM Studio API error ${res.status}: ${errText}`);
+      }
+    }
   } finally {
     clearInterval(preFetchTimer);
   }
