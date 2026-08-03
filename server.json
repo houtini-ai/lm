@@ -7,12 +7,12 @@
     "url": "https://github.com/houtini-ai/lm",
     "source": "github"
   },
-  "version": "3.2.2",
+  "version": "3.2.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@houtini/lm",
-      "version": "3.2.2",
+      "version": "3.2.3",
       "transport": [
         {
           "type": "stdio"
