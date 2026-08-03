@@ -20,6 +20,21 @@ Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-c
 
 I wrote a [full walkthrough of why I built this and how I use it day to day](https://houtini.com/how-to-cut-your-claude-code-bill-with-houtini-lm/).
 
+## The manual
+
+This README is the overview. The depth lives in focused pages:
+
+| Page | What's in it |
+|---|---|
+| [Getting started](./docs/GETTING-STARTED.md) | Local models from zero: LM Studio or Docker, what small models are good at, which fit your VRAM |
+| [The tools, in depth](./manual/tools.md) | All eight tools: the parameters that matter, reading the footer, the max_tokens floor |
+| [The craft of delegation](./manual/delegation.md) | What to hand off and how to brief it - the verbatim-echo pattern, micro-chunking, reasoning-model budgets |
+| [Troubleshooting](./manual/troubleshooting.md) | Symptom → cause → fix: empty responses, timeouts, context-length 400s, queuing |
+| [vLLM setup](./docs/SETUP-VLLM.md) · [LM Studio setup](./docs/SETUP-LMSTUDIO.md) | Backend guides, each with the traps that cause silent failures |
+| [vLLM backend notes](./docs/VLLM-BACKEND.md) | The deeper operational record: router topology, thinking toggles, token budgets |
+| [CLI mode](./docs/CLI-MODE.md) | Running houtini-lm as a command, not just an MCP server |
+| [Developer guide](./DEVELOPER.md) | Architecture, contributing, release process |
+
 ## How it works
 
 ```
