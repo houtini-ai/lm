@@ -20,7 +20,7 @@
           "name": "HOUTINI_LM_ENDPOINT_URL",
           "description": "Base URL of the OpenAI-compatible API endpoint (e.g. http://localhost:1234, https://openrouter.ai/api). Legacy alias: LM_STUDIO_URL.",
           "isRequired": false,
-          "format": "url"
+          "format": "string"
         },
         {
           "name": "HOUTINI_LM_API_KEY",
