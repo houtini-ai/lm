@@ -1,0 +1,28 @@
+name: Publish to MCP Registry
+
+# Publishes server.json to registry.modelcontextprotocol.io using GitHub OIDC —
+# the workflow's identity IS the org, so no OAuth app grants or public-membership
+# requirements apply. Run manually from the Actions tab after each npm release.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC token for the registry
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mcp-publisher
+        run: |
+          curl -sL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.0/mcp-publisher_linux_amd64.tar.gz" | tar xz
+          chmod +x mcp-publisher
+
+      - name: Login (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
