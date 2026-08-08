@@ -15,13 +15,13 @@ src/
   model-cache.ts      SQLite (node:sqlite, WAL) — model profiles, thinking-
                       support detection, per-model performance history
 server.json           MCP registry manifest
-test.mjs              Direct-client integration tests (hits /v1 endpoints)
-test-mcp-e2e.mjs      End-to-end MCP harness — spawns the built server over
+scripts/test.mjs      Direct-client integration tests (hits /v1 endpoints)
+scripts/test-mcp-e2e.mjs End-to-end MCP harness — spawns the built server over
                       stdio, drives real tool calls, verifies provider paths
-benchmark.mjs         Throughput + savings benchmark
-shakedown.mjs         End-to-end self-test — runs 7 of the 8 tools in sequence (all except stats)
-SHAKEDOWN.md          Canonical test prompt (for running via Claude chat)
-add-shebang.mjs       Post-build — prepends #!/usr/bin/env node to dist/index.js
+scripts/benchmark.mjs Throughput + savings benchmark
+scripts/shakedown.mjs End-to-end self-test — runs 7 of the 8 tools in sequence (all except stats)
+docs/SHAKEDOWN.md     Canonical test prompt (for running via Claude chat)
+scripts/add-shebang.mjs Post-build — prepends #!/usr/bin/env node to dist/index.js
 ```
 
 ## Commands
@@ -35,7 +35,7 @@ npm run shakedown    # end-to-end self-test — sanity-check install + benchmark
 Integration test:
 
 ```bash
-HOUTINI_LM_ENDPOINT_URL=http://host:1234 node test.mjs
+HOUTINI_LM_ENDPOINT_URL=http://host:1234 node scripts/test.mjs
 ```
 
 Strict-mode TypeScript is enabled — the build must pass with zero errors.
@@ -272,7 +272,7 @@ When you do need provider-specific behaviour:
 5. **Capabilities metadata mapping** — if the native list format doesn't
    fit `ModelInfo`, map it in the probe function (see the Ollama
    `/api/tags` branch for an example).
-6. **Smoke-test** — run `test-mcp-e2e.mjs` against the new endpoint and
+6. **Smoke-test** — run `scripts/test-mcp-e2e.mjs` against the new endpoint and
    confirm the expected profile path fires by grepping the stderr log.
 
 ## Releasing
@@ -283,7 +283,7 @@ When you do need provider-specific behaviour:
 3. `npm run build` — must pass cleanly.
 4. `npm run shakedown` — smoke-test against a live local endpoint.
 5. If the release touches provider-profile code, streaming, model routing,
-   or anything in the hot path, also run `test-mcp-e2e.mjs` against
+   or anything in the hot path, also run `scripts/test-mcp-e2e.mjs` against
    **both** a local endpoint (LM Studio / Ollama) and OpenRouter — the
    profile branches are gated separately. See the testing matrix above.
 6. Commit `v{X.Y.Z}: short description` (version-prefixed for releases).
@@ -317,26 +317,26 @@ The `prepublishOnly` hook runs the build automatically. Use
 
 Four independent test harnesses, each with a different scope:
 
-- **`test.mjs`** — **direct-client** integration test. Hits the provider's
+- **`scripts/test.mjs`** — **direct-client** integration test. Hits the provider's
   `/v1/*` endpoints without going through the MCP server. Good for
   regression-checking changes to streaming / parsing and for confirming a
   new provider speaks OpenAI protocol at all. Honours
   `HOUTINI_LM_ENDPOINT_URL` / `HOUTINI_LM_API_KEY` (plus legacy
   `LM_STUDIO_*` / `LM_PASSWORD` / `OPENROUTER_API_KEY`).
-- **`test-mcp-e2e.mjs`** — **end-to-end MCP** test. Spawns the built server
+- **`scripts/test-mcp-e2e.mjs`** — **end-to-end MCP** test. Spawns the built server
   over stdio and drives real tool calls (`list_models`, `chat`, parallel
   requests, optional `model` pin). This is the one that verifies
   provider-profile paths fire correctly — grep the stderr log for
   `OpenRouter model …: reasoning.exclude=true` to confirm the OpenRouter
   branch took over. Set `PIN_MODEL=<id>` to also test the per-call model
   override.
-- **`benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
-- **`shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
+- **`scripts/benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
+- **`scripts/shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
   Runs 7 of the 8 tools end-to-end (all except `stats`) and prints a summary table with TTFT, tok/s,
   token counts, and reasoning-token split per call. Use this to verify an
   install or post-release.
 
-The conversational equivalent lives in [SHAKEDOWN.md](./SHAKEDOWN.md) —
+The conversational equivalent lives in [SHAKEDOWN.md](./docs/SHAKEDOWN.md) —
 paste it into a Claude session with houtini-lm attached and Claude drives
 the sequence, evaluating output quality along the way.
 
@@ -349,13 +349,13 @@ the OpenRouter branch (and vice-versa):
 
 ```bash
 # Local (LM Studio / Ollama / anything serialised)
-HOUTINI_LM_ENDPOINT_URL=http://localhost:1234 node test-mcp-e2e.mjs
+HOUTINI_LM_ENDPOINT_URL=http://localhost:1234 node scripts/test-mcp-e2e.mjs
 
 # Remote (OpenRouter — no semaphore, reasoning.exclude, retry policy)
 HOUTINI_LM_ENDPOINT_URL=https://openrouter.ai/api \
   HOUTINI_LM_API_KEY=sk-or-v1-... \
   PIN_MODEL=nvidia/nemotron-3-nano-30b-a3b:free \
-  node test-mcp-e2e.mjs
+  node scripts/test-mcp-e2e.mjs
 ```
 
 ## Quality-signal flags reference

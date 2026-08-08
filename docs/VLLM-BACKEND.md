@@ -62,7 +62,7 @@ Two causes, both fixed in source and verified end-to-end against live Qwen3-Code
 - `auto` keeps HF-metadata detection (fine for LM Studio / Ollama where the model id is the real one).
 - `on` forces thinking on.
 
-Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `test-vllm-thinking.mjs` (`npm run test:vllm`).
+Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `scripts/test-vllm-thinking.mjs` (`npm run test:vllm`).
 
 > Note: `HOUTINI_LM_THINKING=off` only *suppresses* thinking; it never fabricates it. for hard standalone subtasks that want the model's own reasoning, leave it `auto` and rely on detection, or run a second endpoint with thinking on.
 

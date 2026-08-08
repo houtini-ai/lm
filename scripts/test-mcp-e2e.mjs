@@ -13,8 +13,14 @@
 
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const server = spawn(process.execPath, ['dist/index.js'], {
+// Resolve the built server from the repo root rather than the cwd, so this runs
+// the same whether it's invoked from the root or from scripts/.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+const server = spawn(process.execPath, [path.join(repoRoot, 'dist', 'index.js')], {
   env: { ...process.env },
   stdio: ['pipe', 'pipe', 'pipe'],
 });

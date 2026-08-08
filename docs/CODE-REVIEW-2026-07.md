@@ -264,11 +264,11 @@ server-provided stats; (4) file-read confinement + credential redaction;
 
 ## Low — docs / config / CI (fix before re-release)
 
-- ⏳ **`benchmark.mjs` hardcodes Windows paths from another repo** —
+- ⏳ **`scripts/benchmark.mjs` hardcodes Windows paths from another repo** —
   `benchmark.mjs:65`. `C:/MCP/houtini-lm/...` (and a sibling `gemini-mcp` repo)
   at module top-level → `ENOENT` on any other machine. Unrunnable as shipped.
 
-- ⏳ **`shakedown.mjs` ignores documented env + auth** — `shakedown.mjs:25`.
+- ⏳ **`scripts/shakedown.mjs` ignores documented env + auth** — `shakedown.mjs:25`.
   Reads only legacy `LM_STUDIO_URL` (not the README-documented, code-preferred
   `HOUTINI_LM_ENDPOINT_URL`) and sends no `Authorization` header, so the
   canonical self-test 401s on any authenticated endpoint and can target the
@@ -285,7 +285,7 @@ server-provided stats; (4) file-read confinement + credential redaction;
   raw `/v1` HTTP API rather than the MCP tool-dispatch layer, so a regression in
   either passes the "full coverage" self-test.
 
-- ⏳ **`test-mcp-e2e.mjs` banner prints the wrong env var** —
+- ⏳ **`scripts/test-mcp-e2e.mjs` banner prints the wrong env var** —
   `test-mcp-e2e.mjs:89`. Prints `LM_STUDIO_URL` though DEVELOPER.md documents
   invoking with `HOUTINI_LM_ENDPOINT_URL` → "Target: undefined" in the output.
 

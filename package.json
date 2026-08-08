@@ -9,11 +9,11 @@
     "houtini-lm": "dist/index.js"
   },
   "scripts": {
-    "test:vllm": "node test-vllm-thinking.mjs",
-    "test:overflow": "node test-context-overflow.mjs",
-    "build": "tsc && node add-shebang.mjs",
+    "test:vllm": "node scripts/test-vllm-thinking.mjs",
+    "test:overflow": "node scripts/test-context-overflow.mjs",
+    "build": "tsc && node scripts/add-shebang.mjs",
     "dev": "tsc --watch",
-    "shakedown": "node shakedown.mjs",
+    "shakedown": "node scripts/shakedown.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

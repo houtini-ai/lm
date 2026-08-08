@@ -3,7 +3,7 @@
 This is the canonical end-to-end test for houtini-lm. There are two ways to
 run it:
 
-1. **Automated** — `npm run shakedown` runs [`shakedown.mjs`](./shakedown.mjs)
+1. **Automated** — `npm run shakedown` runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs)
    which talks directly to your configured endpoint (LM Studio, Ollama, or any
    OpenAI-compatible host) and prints a summary table with real TTFT / tok/s /
    reasoning-token-split for each tool.

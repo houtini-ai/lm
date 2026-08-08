@@ -1,6 +1,6 @@
 # Contributing to Houtini LM
 
-Thanks for your interest in improving this MCP server. This guide covers the practicals; for architecture and conventions, see [CLAUDE.md](./CLAUDE.md).
+Thanks for your interest in improving this MCP server. This guide covers the practicals; for architecture and conventions, see [DEVELOPER.md](./DEVELOPER.md).
 
 ## Setup
 
@@ -25,10 +25,10 @@ All TypeScript is strict mode. Build must pass with zero errors before you open 
 ## Testing
 
 ```bash
-HOUTINI_LM_ENDPOINT_URL=http://localhost:1234 node test.mjs
+HOUTINI_LM_ENDPOINT_URL=http://localhost:1234 node scripts/test.mjs
 ```
 
-`test.mjs` is an integration test — it hits a live LLM server and runs sequential assertions. There is no mocking layer and no unit-test framework; this is deliberate (see [CLAUDE.md](./CLAUDE.md) → *Coding Conventions*).
+`scripts/test.mjs` is an integration test — it hits a live LLM server and runs sequential assertions. There is no mocking layer and no unit-test framework; this is deliberate (see [DEVELOPER.md](./DEVELOPER.md)).
 
 If you don't have a local LLM available, note that in your PR and a maintainer will run the tests before merge.
 
@@ -44,7 +44,7 @@ If you don't have a local LLM available, note that in your PR and a maintainer w
 2. Keep PRs focused — one concern per PR, small enough to review in a sitting.
 3. Update [CHANGELOG.md](./CHANGELOG.md) under an `## [Unreleased]` heading if your change is user-visible.
 4. Make sure `npm run build` passes — CI will check this on PR.
-5. If you're touching a tool's behaviour, run `test.mjs` against a local LLM and note in the PR that you did.
+5. If you're touching a tool's behaviour, run `scripts/test.mjs` against a local LLM and note in the PR that you did.
 
 ## What to work on
 

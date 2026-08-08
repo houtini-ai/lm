@@ -38,6 +38,7 @@ This README is the overview. The depth lives in focused pages:
 | [vLLM setup](./docs/SETUP-VLLM.md) · [LM Studio setup](./docs/SETUP-LMSTUDIO.md) | Backend guides, each with the traps that cause silent failures |
 | [vLLM backend notes](./docs/VLLM-BACKEND.md) | The deeper operational record: router topology, thinking toggles, token budgets |
 | [CLI mode](./docs/CLI-MODE.md) | Running houtini-lm as a command, not just an MCP server |
+| [Shakedown test](./docs/SHAKEDOWN.md) | The canonical end-to-end check - `npm run shakedown`, or paste the prompt into Claude and watch all eight tools run |
 | [Developer guide](./DEVELOPER.md) | Architecture, contributing, release process |
 
 ## How it works
@@ -387,7 +388,7 @@ The canonical way to verify an install and get an honest read on what the loaded
 npm run shakedown
 ```
 
-This runs [`shakedown.mjs`](./shakedown.mjs) — an end-to-end test that exercises seven of the eight tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats` is not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
+This runs [`scripts/shakedown.mjs`](./scripts/shakedown.mjs) — an end-to-end test that exercises seven of the eight tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats` is not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
 
 Sample output tail:
 
@@ -406,7 +407,7 @@ Summary
    Tokens offloaded: 10,915 (prompt: 7,289, completion: 3,626, reasoning: 0)
 ```
 
-Want a human-readable quality review rather than just latency numbers? Paste [SHAKEDOWN.md](./SHAKEDOWN.md) into a Claude session that has houtini-lm attached — Claude will drive the seven steps and write you a report on output quality as well as performance.
+Want a human-readable quality review rather than just latency numbers? Paste [SHAKEDOWN.md](./docs/SHAKEDOWN.md) into a Claude session that has houtini-lm attached — Claude will drive the seven steps and write you a report on output quality as well as performance.
 
 ## Think-block handling
 

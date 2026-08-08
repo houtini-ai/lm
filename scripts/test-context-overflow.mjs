@@ -1,7 +1,7 @@
 // Unit test for the context-overflow parser (the self-heal that retries once
 // when a proxy advertises a larger context than the model actually loaded).
 // Pure function, no backend needed. Run: npm run test:overflow
-import { parseContextOverflow, correctedMaxTokens } from './dist/context-overflow.js';
+import { parseContextOverflow, correctedMaxTokens } from '../dist/context-overflow.js';
 
 let failed = 0;
 const eq = (name, got, want) => {
