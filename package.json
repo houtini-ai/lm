@@ -58,6 +58,8 @@
   },
   "files": [
     "dist/**/*",
+    "assets/logo.png",
+    "assets/icon.png",
     "server.json",
     "README.md",
     "LICENSE"

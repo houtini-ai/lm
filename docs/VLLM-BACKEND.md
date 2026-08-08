@@ -48,7 +48,7 @@ Qwen3.6's thinking can be disabled per-request via the standard vLLM passthrough
 { "chat_template_kwargs": { "enable_thinking": false } }
 ```
 
-Measured on the same server, same tool-call request: **thinking=true → 135 tokens, 3.7s; thinking=false → 26 tokens, 0.8s** — identical correct structured tool call. When Claude orchestrates (Claude does the strategic reasoning, the local model executes), no-think is the right default: ~4x faster responses and far smaller token budgets needed. Expose thinking as an opt-in per call for genuinely hard standalone subtasks (tricky refactors, maths). With thinking off, the empty-content trap in Caveat 1 also largely disappears — but keep the min-tokens floor anyway for thinking-enabled calls.
+Measured on the same server, same tool-call request: **thinking=true → 135 tokens, 3.7s; thinking=false → 26 tokens, 0.8s** — identical correct structured tool call. When Claude orchestrates (Claude does the strategic reasoning, the local model executes), no-think is the right default: ~4x faster responses and far smaller token budgets needed. Expose thinking as an opt-in per call for hard standalone subtasks (tricky refactors, maths). With thinking off, the empty-content trap in Caveat 1 also largely disappears — but keep the min-tokens floor anyway for thinking-enabled calls.
 
 ## RESOLVED in v3.2.1 — vLLM thinking models returned empty content
 
@@ -64,7 +64,7 @@ Two causes, both fixed in source and verified end-to-end against live Qwen3-Code
 
 Set it in the MCP server's `env` (Claude config) alongside `HOUTINI_LM_ENDPOINT_URL`. Regression-guarded by `test-vllm-thinking.mjs` (`npm run test:vllm`).
 
-> Note: `HOUTINI_LM_THINKING=off` only *suppresses* thinking; it never fabricates it. For genuinely hard standalone subtasks that want the model's own reasoning, leave it `auto` and rely on detection, or run a second endpoint with thinking on.
+> Note: `HOUTINI_LM_THINKING=off` only *suppresses* thinking; it never fabricates it. for hard standalone subtasks that want the model's own reasoning, leave it `auto` and rely on detection, or run a second endpoint with thinking on.
 
 ## Caveat 2 — tool calls
 

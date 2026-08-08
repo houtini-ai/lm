@@ -2,6 +2,15 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.houtini-ai/lm",
   "description": "Connect Claude to any OpenAI-compatible LLM endpoint and offload routine work to a local model.",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/houtini-ai/houtini-lm/main/assets/logo.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "512x512"
+      ]
+    }
+  ],
   "repository": {
     "url": "https://github.com/houtini-ai/lm",
     "source": "github"

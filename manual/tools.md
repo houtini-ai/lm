@@ -15,14 +15,14 @@ The general-purpose tool. One message in, one response out, routed to the best l
 - `temperature` - 0.1 for factual and code work, 0.3 for analysis, 0.7 when you want ideas. Local models get weird above 0.5 on code.
 - `max_tokens` - **leave it unset.** The server checks the loaded model's real context window and allocates 25% of it as the output budget. Values below 4,096 are ignored entirely (see [the floor](#the-max_tokens-floor), below).
 - `json_schema` - force structured output. Pass a JSON Schema and the response is guaranteed-valid JSON conforming to it. The reliable way to get parseable data out of a small model - much better than asking nicely in the prompt.
-- `seed` + `temperature: 0` - byte-identical output across calls. Genuinely deterministic (we've tested it): same seed, same prompt, same bytes. Useful for regression-testing prompts.
+- `seed` + `temperature: 0` - byte-identical output across calls. Deterministic (we've tested it): same seed, same prompt, same bytes. Useful for regression-testing prompts.
 - `stop`, `top_p`, `top_k`, `repeat_penalty`, `frequency_penalty`, `presence_penalty` - the full sampling set, range-validated server-side, forwarded only when you set them.
 
 ## custom_prompt
 
 Same engine as `chat`, different shape: explicit `system` / `context` / `instruction` separation. The three-part structure exists because small models bleed context into instructions when everything arrives as one blob - the server has the model acknowledge the context in a staged turn before the instruction lands.
 
-Reach for it when the material and the ask are genuinely separate things:
+Reach for it when the material and the ask are separate things:
 
 - Code review - full source as `context`, "list bugs as JSON {line, issue, fix}" as `instruction`
 - Comparing two implementations

@@ -35,6 +35,7 @@ import {
   type PromptHints,
 } from './model-cache.js';
 import { acquireInferenceLock } from './inference-lock.js';
+import { SERVER_VERSION } from './version.js';
 import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -2237,7 +2238,7 @@ const SIDEKICK_INSTRUCTIONS =
   `Call \`discover\` in delegation-heavy sessions to see what model is loaded, its capability profile, and — after the first real call — its measured speed. The response footer reports cumulative tokens kept in the user's quota.`;
 
 const server = new Server(
-  { name: 'houtini-lm', version: '3.2.3' },
+  { name: 'houtini-lm', version: SERVER_VERSION },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 

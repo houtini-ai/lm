@@ -22,7 +22,7 @@ If your client is the ignoring kind: split the work into smaller calls ([micro-c
 
 **The estimator thinks your hardware can't prefill this input in time.** It learns from measured (prompt_tokens, TTFT) pairs per model, weights recent samples over stale ones, and only refuses on a fit it trusts (R² ≥ 0.5).
 
-- If the input genuinely is big: split the file list, or trim the largest file. The diagnostic tells you the estimated tokens and seconds.
+- If the input really is big: split the file list, or trim the largest file. The diagnostic tells you the estimated tokens and seconds.
 - If you've just changed your backend's performance settings (or moved to faster hardware), a few successful smaller calls teach it the new reality quickly - the recency weighting means stale slow samples wash out within about half a dozen calls.
 - If it keeps refusing something you know your machine can handle, that's a bug worth reporting with the diagnostic text.
 

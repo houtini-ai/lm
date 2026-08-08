@@ -258,7 +258,7 @@ When you do need provider-specific behaviour:
    URL-based auto-detection with an explicit `HOUTINI_LM_PROVIDER` env var
    as override.
 2. **Provider profile** — add a branch to `getProviderProfile()` for the
-   new backend. Set only the flags that genuinely differ. Don't speculate
+   new backend. Set only the flags that differ. Don't speculate
    — if you're unsure whether a flag should be on or off, leave it at the
    default and let the first real usage show you.
 3. **Model listing** — if the server has a richer native endpoint worth

@@ -138,7 +138,7 @@ They're weak at multi-file reasoning, novel algorithms, subtle bug-hunting, and
 long-context synthesis. Give them complete context and a strict output contract.
 
 **Mid (24–32B) — the delegation sweet spot.** Code-specialised models in this
-band (e.g. Qwen2.5-Coder-32B) are genuinely useful for real code review, test
+band (e.g. Qwen2.5-Coder-32B) are useful for real code review, test
 generation, and multi-function refactors. This is where most people get the best
 ratio of capability to hardware cost. Still verify before committing.
 
