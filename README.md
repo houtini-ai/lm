@@ -35,7 +35,7 @@ This README is the overview. The depth lives in focused pages:
 | [The tools, in depth](./manual/tools.md) | All eight tools: the parameters that matter, reading the footer, the max_tokens floor |
 | [The craft of delegation](./manual/delegation.md) | What to hand off and how to brief it - the verbatim-echo pattern, micro-chunking, reasoning-model budgets |
 | [Troubleshooting](./manual/troubleshooting.md) | Symptom → cause → fix: empty responses, timeouts, context-length 400s, queuing |
-| [vLLM setup](./docs/SETUP-VLLM.md) · [LM Studio setup](./docs/SETUP-LMSTUDIO.md) | Backend guides, each with the traps that cause silent failures |
+| [LM Studio setup](./docs/SETUP-LMSTUDIO.md) · [Ollama setup](./docs/SETUP-OLLAMA.md) · [vLLM setup](./docs/SETUP-VLLM.md) | Backend guides, each with the traps that cause silent failures |
 | [vLLM backend notes](./docs/VLLM-BACKEND.md) | The deeper operational record: router topology, thinking toggles, token budgets |
 | [CLI mode](./docs/CLI-MODE.md) | Running houtini-lm as a command, not just an MCP server |
 | [Shakedown test](./docs/SHAKEDOWN.md) | The canonical end-to-end check - `npm run shakedown`, or paste the prompt into Claude and watch all eight tools run |
@@ -64,7 +64,7 @@ Claude's the architect. Your local model's the drafter. Claude QAs everything.
 > New to local models? See **[docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)** — installing LM Studio or a Docker endpoint, getting an OpenAI-compatible URL for houtini, what the smaller models are good at, and which models fit on 16/32/64/96/128 GB of VRAM.
 >
 > Setting up a specific backend? Step-by-step guides, each with the traps that cause silent failures:
-> **[LM Studio](./docs/SETUP-LMSTUDIO.md)** (easiest, desktop) · **[vLLM](./docs/SETUP-VLLM.md)** (throughput, tool-calling, long context).
+> **[LM Studio](./docs/SETUP-LMSTUDIO.md)** (easiest, desktop) · **[Ollama](./docs/SETUP-OLLAMA.md)** (two commands, CLI) · **[vLLM](./docs/SETUP-VLLM.md)** (throughput, tool-calling, long context).
 
 ### Claude Code
 
