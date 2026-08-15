@@ -37,6 +37,7 @@ import {
 import { acquireInferenceLock } from './inference-lock.js';
 import { SERVER_VERSION } from './version.js';
 import { parseContextOverflow, correctedMaxTokens } from './context-overflow.js';
+import { resolveThinkingOverride } from './thinking-mode.js';
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, basename, resolve, sep } from 'node:path';
@@ -1044,30 +1045,40 @@ async function chatCompletionStreamingInner(
     // endpoint that serves "coder-next" instead of the real Qwen3-Coder-Next id),
     // so a genuine thinking model looks non-thinking and the no-think toggle
     // never fires — the answer then lands in reasoning_content with empty content.
-    // HOUTINI_LM_THINKING=off forces no-think for every call regardless of
-    // detection (correct when an orchestrator does the reasoning and the local
-    // model only executes). 'on' would force the opposite; unset/'auto' keeps
-    // detection. Only ever suppresses thinking — never fabricates it.
-    const thinkingMode = (process.env.HOUTINI_LM_THINKING || 'auto').toLowerCase();
-    if (thinkingMode === 'off' || thinking?.supportsThinkingToggle) {
-      body.enable_thinking = false;
+    // Explicit on/off values override detection. auto preserves the historical
+    // executor-first behaviour: detected thinking models are suppressed, while
+    // unknown models are left to their backend defaults.
+    const thinkingOverride = resolveThinkingOverride(
+      process.env.HOUTINI_LM_THINKING,
+      Boolean(thinking?.supportsThinkingToggle),
+    );
+    if (thinkingOverride !== undefined) {
+      body.enable_thinking = thinkingOverride;
       // vLLM's OpenAI server ONLY honours the toggle when it is nested inside
       // chat_template_kwargs; a top-level enable_thinking is silently dropped
       // (LM Studio / Ollama accept the top-level form). Without this, vLLM
       // thinking models (Qwen3.6, Qwen3-Coder-Next) return the answer in
       // reasoning_content with empty content. Send both shapes for portability.
-      body.chat_template_kwargs = { ...(body.chat_template_kwargs as Record<string, unknown> | undefined), enable_thinking: false };
-      const reasoningValue = getReasoningEffortValue(modelId);
-      if (reasoningValue !== null) {
-        body.reasoning_effort = reasoningValue;
+      body.chat_template_kwargs = {
+        ...(body.chat_template_kwargs as Record<string, unknown> | undefined),
+        enable_thinking: thinkingOverride,
+      };
+
+      if (thinkingOverride) {
+        process.stderr.write(`[houtini-lm] Thinking model ${modelId}: enable_thinking=true (forced by HOUTINI_LM_THINKING)\n`);
+      } else {
+        const reasoningValue = getReasoningEffortValue(modelId);
+        if (reasoningValue !== null) {
+          body.reasoning_effort = reasoningValue;
+        }
+        // Inflation uses effectiveMaxTokens (the context-aware value), not
+        // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
+        const beforeInflation = effectiveMaxTokens;
+        const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
+        body.max_tokens = inflated;
+        body.max_completion_tokens = inflated;
+        process.stderr.write(`[houtini-lm] Thinking model ${modelId}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
       }
-      // Inflation uses effectiveMaxTokens (the context-aware value), not
-      // DEFAULT_MAX_TOKENS — otherwise big-context models get sized down.
-      const beforeInflation = effectiveMaxTokens;
-      const inflated = capToContext(Math.max(beforeInflation * 4, beforeInflation + 2000));
-      body.max_tokens = inflated;
-      body.max_completion_tokens = inflated;
-      process.stderr.write(`[houtini-lm] Thinking model ${modelId}: reasoning_effort=${reasoningValue ?? '(omitted)'}, enable_thinking=false, max_tokens inflated ${beforeInflation} → ${inflated}\n`);
     }
   }
 

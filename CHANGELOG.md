@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **`HOUTINI_LM_THINKING=on` now forces thinking.** The recognised-model branch previously disabled thinking regardless of the configured mode because `supportsThinkingToggle` was ORed directly with the `off` check. Explicit `on` now sends `enable_thinking: true` in both the top-level and nested `chat_template_kwargs` shapes; `off` and `auto` retain their existing behaviour.
+
 ## [3.2.3] - 2026-08-03
 
 ### Fixed
