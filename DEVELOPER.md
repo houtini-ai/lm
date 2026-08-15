@@ -55,8 +55,10 @@ runs. The moving parts, in order:
      Claude-thinking / gpt-oss and returns clean text content only. Budget
      still inflated 4× (or +2000) because some upstream providers bill
      reasoning against the cap before filtering.
-   - `'think-blocks'` (local) — call `getThinkingSupport(modelId)`. If true:
-     set `enable_thinking: false` (Qwen3 vendor param), set
+   - `'think-blocks'` (local) — resolve `HOUTINI_LM_THINKING` first. `on`
+     explicitly sends `enable_thinking: true`; `off` explicitly sends false;
+     `auto` calls `getThinkingSupport(modelId)` and, when detected, sets
+     `enable_thinking: false` (Qwen3 vendor param), sets
      `reasoning_effort` to a backend-appropriate minimum (`'none'` on
      LM Studio + Ollama, `'low'` on generic OpenAI-compatible), and inflate
      `max_tokens` 4× as a safety net for backends that ignore both flags
@@ -110,6 +112,11 @@ backend:
 | `enable_thinking: false` | Top-level body field | Qwen3 family via LM Studio |
 | `reasoning_effort` | Top-level body field — backend-mapped value | LM Studio (`'none'`), Ollama (`'none'`), OpenAI & DeepSeek (`'low'`) |
 | `max_tokens` inflation (4×) | Increases generation budget | Safety net — works even when the model ignores the other two |
+
+`HOUTINI_LM_THINKING=on` bypasses those suppression signals and sends
+`enable_thinking: true` in both the top-level and `chat_template_kwargs`
+shapes. `resolveThinkingOverride()` in `thinking-mode.ts` owns the three-state
+resolution and is covered by `npm run test:thinking-mode`.
 
 Detection lives in `model-cache.ts` — `detectThinkingSupport` (HF-chat-template
 based) and `detectThinkingSupportFromArch` (arch/id regex fallback). The two

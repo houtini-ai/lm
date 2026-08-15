@@ -10,6 +10,7 @@
   },
   "scripts": {
     "test:vllm": "node scripts/test-vllm-thinking.mjs",
+    "test:thinking-mode": "node scripts/test-thinking-mode.mjs",
     "test:overflow": "node scripts/test-context-overflow.mjs",
     "test:lock": "node scripts/verify-inference-lock.mjs",
     "build": "tsc && node scripts/add-shebang.mjs",
