@@ -16,9 +16,15 @@
  * - Staleness is AGE-FIRST (past the threshold → steal regardless), then same-host
  *   dead-PID (`kill(pid,0)` → ESRCH → steal). Age-first means a reused PID can't
  *   pin a dead holder's lock forever.
+ * - A read failure is classified, not collapsed to "no lock". A GARBLED file (empty or
+ *   non-JSON, e.g. a holder died between create and write) carries no token, so
+ *   token-checked removal can never clear it and it is removed outright. A file we simply
+ *   cannot READ (EACCES/EBUSY/EIO) is not evidence of a dead holder and never authorises
+ *   a steal.
  * - FAIL-OPEN: any fs error, or waiting past the cap, proceeds WITHOUT the lock
  *   rather than hanging a tool call. Serialisation is a throughput optimisation,
- *   never a correctness dependency.
+ *   never a correctness dependency. The deadline is enforced on the steal path too —
+ *   every path out of the acquire loop is bounded.
  *
  * Residual: if a holder is hard-killed and several waiters race to steal in the
  * same sub-millisecond window, a transient double-acquire is possible (two
@@ -42,6 +48,13 @@ const POLL_MS = 150;
 // never steal a lock from a genuinely long-running inference on time alone.
 const STALE_MS = 7 * 60_000;
 // Default cap on how long we'll wait before giving up and proceeding unlocked.
+//
+// This is DELIBERATELY below STALE_MS, and that is not a bug. shouldSteal() ages out a
+// lock on `Date.now() - info.at`, i.e. the age of the LOCK, not how long the current
+// caller has waited — so a caller arriving at an already-stale lock steals it on its
+// first iteration and never consults this cap. Raising it above STALE_MS would only make
+// callers block longer before failing open, which is the wrong direction for a module
+// whose contract is that serialisation is never a correctness dependency.
 const DEFAULT_MAX_WAIT_MS = 6 * 60_000;
 
 interface LockInfo { pid?: number; host?: string; at?: number; token?: string }
@@ -59,12 +72,47 @@ process.on('exit', () => {
   }
 });
 
-function readLock(): LockInfo | null {
+/**
+ * Reading the lock has three distinct failure modes and they need different handling.
+ * Collapsing them all to `null` is what allowed a garbled file to wedge the acquire loop:
+ *
+ * - `missing`    — no file. Just retry the acquire.
+ * - `garbled`    — file exists but is empty or not JSON. There is NO token to match, so
+ *                  token-checked removal is a no-op and the file must be removed outright
+ *                  or nothing will ever clear it. Reachable whenever a holder dies between
+ *                  creating the file and writing to it.
+ * - `unreadable` — the file exists but we could not read it (EACCES, EBUSY, EIO). This is
+ *                  NOT evidence the lock is dead, so it must never authorise a steal.
+ */
+type LockRead =
+  | { state: 'ok'; info: LockInfo }
+  | { state: 'missing' }
+  | { state: 'garbled' }
+  | { state: 'unreadable' };
+
+function readLockDetailed(): LockRead {
+  let raw: string;
   try {
-    return JSON.parse(readFileSync(LOCK_PATH, 'utf8')) as LockInfo;
-  } catch {
-    return null; // missing or garbled
+    raw = readFileSync(LOCK_PATH, 'utf8');
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT'
+      ? { state: 'missing' }
+      : { state: 'unreadable' };
   }
+  try {
+    const info = JSON.parse(raw) as LockInfo;
+    // A JSON scalar (`null`, `7`, `"x"`) parses fine but is not a lock record.
+    if (!info || typeof info !== 'object') return { state: 'garbled' };
+    return { state: 'ok', info };
+  } catch {
+    return { state: 'garbled' };
+  }
+}
+
+/** Convenience wrapper for the read-only callers that only care about a valid record. */
+function readLock(): LockInfo | null {
+  const r = readLockDetailed();
+  return r.state === 'ok' ? r.info : null;
 }
 
 /** Should the given on-disk lock be stolen? Age first (covers PID reuse and
@@ -90,6 +138,18 @@ function stealIfUnchanged(expectedToken: string | undefined): void {
 }
 
 /**
+ * Remove a lock file that carries no usable token. Unconditional by necessity: there is
+ * nothing to compare against, so `stealIfUnchanged` can never remove it. Without this the
+ * acquire loop retries forever against a file it will not delete.
+ *
+ * The unconditional unlink is safe precisely because it is gated on `garbled` rather than
+ * on any read failure — a lock we merely cannot read is left alone.
+ */
+function removeGarbledLock(): void {
+  try { unlinkSync(LOCK_PATH); } catch { /* another waiter beat us to it */ }
+}
+
+/**
  * Acquire the cross-process inference lock. Returns a release function (safe to
  * call more than once; only unlinks if we still own the file). `onWait` is
  * invoked periodically while blocked so the caller can emit keepalive progress.
@@ -110,7 +170,17 @@ export async function acquireInferenceLock(
     try {
       const token = `${process.pid}-${HOST}-${randomUUID()}`;
       const fd = openSync(LOCK_PATH, 'wx'); // atomic: EEXIST if already held
-      writeSync(fd, JSON.stringify({ pid: process.pid, host: HOST, at: Date.now(), token }));
+      // Once the file exists we own the cleanup obligation. A throw from writeSync would
+      // otherwise leak the descriptor AND strand a zero-byte lock that no release and no
+      // exit handler can remove (myToken is not yet set) — which is exactly the garbled
+      // file that used to wedge every other process's acquire loop.
+      try {
+        writeSync(fd, JSON.stringify({ pid: process.pid, host: HOST, at: Date.now(), token }));
+      } catch (writeErr) {
+        try { closeSync(fd); } catch { /* ignore */ }
+        try { unlinkSync(LOCK_PATH); } catch { /* ignore */ }
+        throw writeErr;
+      }
       closeSync(fd);
       myToken = token;
       let released = false;
@@ -128,9 +198,23 @@ export async function acquireInferenceLock(
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
         return () => { /* fail open — run unlocked rather than block */ };
       }
-      const info = readLock();
-      if (shouldSteal(info)) {
-        stealIfUnchanged(info?.token);
+      const read = readLockDetailed();
+      // An unreadable file is not evidence of a dead holder, so it must not authorise a
+      // steal. Treat it as held and fall through to the wait/fail-open path.
+      const stealable =
+        read.state === 'garbled' ||
+        read.state === 'missing' ||
+        (read.state === 'ok' && shouldSteal(read.info));
+
+      if (stealable) {
+        if (read.state === 'garbled') removeGarbledLock();
+        else if (read.state === 'ok') stealIfUnchanged(read.info.token);
+        // Bound the steal path too. It previously `continue`d straight past both the
+        // deadline check and the sleep, so any condition that kept re-presenting a
+        // stealable lock span a core forever and never failed open.
+        if (Date.now() - start > maxWaitMs) {
+          return () => { /* gave up during steal contention; run unlocked */ };
+        }
         continue; // retry acquire immediately
       }
       const waited = Date.now() - start;
