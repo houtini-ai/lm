@@ -48,10 +48,14 @@ const POLL_MS = 150;
 // never steal a lock from a genuinely long-running inference on time alone.
 const STALE_MS = 7 * 60_000;
 // Default cap on how long we'll wait before giving up and proceeding unlocked.
-// MUST exceed STALE_MS. At the previous 6 minutes every waiter failed open a minute
-// before the lock became stealable on age, so the age-based steal in shouldSteal() was
-// unreachable at default settings and a wedged holder was never cleaned up by anyone.
-const DEFAULT_MAX_WAIT_MS = STALE_MS + 60_000;
+//
+// This is DELIBERATELY below STALE_MS, and that is not a bug. shouldSteal() ages out a
+// lock on `Date.now() - info.at`, i.e. the age of the LOCK, not how long the current
+// caller has waited — so a caller arriving at an already-stale lock steals it on its
+// first iteration and never consults this cap. Raising it above STALE_MS would only make
+// callers block longer before failing open, which is the wrong direction for a module
+// whose contract is that serialisation is never a correctness dependency.
+const DEFAULT_MAX_WAIT_MS = 6 * 60_000;
 
 interface LockInfo { pid?: number; host?: string; at?: number; token?: string }
 

@@ -114,16 +114,28 @@ await check('an aged-out lock is stolen', async () => {
   release();
 });
 
-// The defect qwen3.6 found and I did not: with the old values every waiter failed open
-// one minute before the age-based steal became reachable.
-await check('default wait cap exceeds the staleness threshold', async () => {
-  const src = readFileSync(new URL('../src/inference-lock.ts', import.meta.url), 'utf8');
-  const stale = /const STALE_MS = (\d+) \* 60_000/.exec(src);
-  assert(stale, 'could not parse STALE_MS');
-  const usesDerived = /const DEFAULT_MAX_WAIT_MS = STALE_MS \+/.test(src);
-  assert(usesDerived,
-    'DEFAULT_MAX_WAIT_MS must be derived from STALE_MS so it can never drift below it; ' +
-    'otherwise the age-based steal is unreachable at default settings');
+// Pins the reasoning that DEFAULT_MAX_WAIT_MS < STALE_MS is deliberate, not a defect.
+//
+// It was briefly "fixed" on the theory that a wait cap below the staleness threshold made
+// the age-based steal unreachable. That is wrong: shouldSteal() ages out on the age of the
+// LOCK, not on how long this caller has waited, so an already-stale lock is stolen on the
+// first iteration and the cap is never consulted. This test would have caught the mistake.
+await check('a stale lock is stolen immediately, even with a wait cap far below STALE_MS', async () => {
+  writeFileSync(LOCK, JSON.stringify({
+    pid: process.pid, host: (await import('node:os')).hostname(),
+    at: Date.now() - 60 * 60_000, token: 'ancient',
+  }));
+  const t0 = Date.now();
+  // 300ms cap: orders of magnitude below STALE_MS. If the cap gated the age check this
+  // would fail open without stealing.
+  const release = await acquireInferenceLock({ maxWaitMs: 300 });
+  const took = Date.now() - t0;
+  assert(took < 250, `should have stolen on the first iteration, took ${took}ms`);
+  const info = JSON.parse(readFileSync(LOCK, 'utf8'));
+  assert(info.token !== 'ancient',
+    'the stale lock should have been replaced by ours on the first iteration, which proves ' +
+    'the age check does not depend on maxWaitMs');
+  release();
 });
 
 console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILED`}\n`);
